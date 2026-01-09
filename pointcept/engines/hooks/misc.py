@@ -296,7 +296,10 @@ class PreciseEvaluator(HookBase):
             best_path = os.path.join(
                 self.trainer.cfg.save_path, "model", "model_best.pth"
             )
-            checkpoint = torch.load(best_path, weights_only=False)
+            try:
+                checkpoint = torch.load(best_path, weights_only=False, map_location="cpu")
+            except TypeError:
+                checkpoint = torch.load(best_path, map_location="cpu")
             weight = OrderedDict()
             for key, value in checkpoint["state_dict"].items():
                 if not key.startswith("module."):
