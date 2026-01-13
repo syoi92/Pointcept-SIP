@@ -1192,3 +1192,608 @@ class Compose(object):
         for t in self.transforms:
             data_dict = t(data_dict)
         return data_dict
+
+
+### SIP part 
+@TRANSFORMS.register_module()
+class Identity(object):
+    def __init__(self, mode="normal", **kwargs):
+        self.mode = mode
+        pass
+
+    def __call__(self, data_dict):
+        if self.mode == "fragment":
+            data_dict["index"] = np.arange(data_dict["coord"].shape[0])
+            return [data_dict]
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class SceneSampling(object):
+    def __init__(
+        self,
+        mode="grid",               # "random" | "grid" | "thinning"
+        keep_ratio=None,           # float in (0, 1]
+        grid_equiv_size=0.05,      # float (meters) for anchor ratio estimation
+        grid_size=0.05,            # grid size used in grid mode (if grid_equiv_size is None)
+        seed=None,
+    ):
+        assert mode in ["random", "grid", "thinning"]
+        self.mode = mode
+        self.keep_ratio = keep_ratio
+        self.grid_equiv_size = grid_equiv_size
+        
+        self.rng = np.random.RandomState(seed) if seed is not None else np.random
+
+        if self.mode == "grid":
+            self.grid_size = grid_size
+            self._grid_sampler = GridSample(
+                grid_size=self.grid_size,
+                hash_type="fnv",
+                mode="train",
+                return_inverse=False,
+                return_grid_coord=True,
+            )
+
+    def __call__(self, data_dict):
+        assert "coord" in data_dict, "No 'coord' in data"
+        N = int(data_dict["coord"].shape[0])
+        if N == 0:
+            return data_dict
+        
+        if self.mode == "grid":
+            return self._grid_mode(data_dict)
+
+        r = self._resolve_keep_ratio(data_dict)
+        r = self._apply_margin(r)
+
+        if r >= 1.0 - 1e-12:
+            return data_dict
+
+        if self.mode == "random":
+            return self._random_mode(data_dict, r)
+
+        # if self.mode == "thinning":
+        #     raise NotImplementedError
+        
+        raise NotImplementedError
+
+    def _clip_ratio(self, r: float):
+        return float(np.clip(r, 1e-6, 1.0))
+
+    def _apply_margin(self, r: float):  # relative margin (+/-5%)
+        ratio_margin = 0.05
+        r = self._clip_ratio(r)
+
+        lo = self._clip_ratio(r * (1.0 - ratio_margin))
+        hi = self._clip_ratio(r * (1.0 + ratio_margin))
+        if hi <= lo:
+            return lo
+        return float(self.rng.uniform(lo, hi))
+
+    def _resolve_keep_ratio(self, data_dict):
+        if self.keep_ratio is not None:
+            return self._clip_ratio(float(self.keep_ratio))
+        return self._clip_ratio(self._estimate_grid_equiv_ratio(data_dict, float(self.grid_equiv_size)))
+
+    def _estimate_grid_equiv_ratio(self, data_dict, grid_size: float):
+        coord = data_dict["coord"]
+        scaled = coord / np.array(grid_size)
+        grid_coord = np.floor(scaled).astype(np.int64)
+        grid_coord -= grid_coord.min(0)
+        key = GridSample.fnv_hash_vec(grid_coord)
+        num_vox = np.unique(key).size
+        return float(num_vox) / float(coord.shape[0])
+
+    def _grid_mode(self, data_dict):
+        out = self._grid_sampler(data_dict)
+        return out
+
+    def _random_mode(self, data_dict, r_target: float):
+        N = int(data_dict["coord"].shape[0])
+        K = int(np.clip(np.round(r_target * N), 1, N))
+        idx = self.rng.choice(N, size=K, replace=False)
+        idx.sort()
+        out = index_operator(data_dict, idx)
+        return out
+
+
+@TRANSFORMS.register_module()
+class SceneFragmentation(object):
+    def __init__(
+        self,
+        mode="base",               # "base" | "ScanBinCrop"
+        split_mode="train",        # "train" | "test"
+        point_max=30000,
+        anchor_grid_size=0.5,      # used only in base mode anchor selection
+        seed=None,
+        azimuth_range=(0.0, 2.0 * np.pi),  # bins over [0, 2pi) by default
+    ):
+        assert mode.lower() in ["base", "scanbincrop", "spherecrop"]
+        assert split_mode in ["train", "test"]
+
+        self.mode = mode.lower()
+        self.mode = "base" if mode.lower() == "spherecrop" else mode.lower()
+        self.split_mode = split_mode
+        self.point_max = int(point_max)
+        self.anchor_grid_size = float(anchor_grid_size)
+        self.max_extra_fragments = 32
+
+        self.az_min = float(azimuth_range[0])
+        self.az_max = float(azimuth_range[1])
+
+        self.rng = np.random.RandomState(seed) if seed is not None else np.random
+
+        try:
+            from scipy.spatial import cKDTree
+            self._cKDTree = cKDTree
+        except Exception:
+            self._cKDTree = None
+
+    def __call__(self, data_dict):
+        assert "coord" in data_dict
+        coord = data_dict["coord"]
+        N = int(coord.shape[0])
+
+        if N == 0:
+            return []
+
+        if N <= self.point_max:
+            idx = np.arange(N, dtype=np.int64)
+            part = index_operator(data_dict, idx, duplicate=True)
+            part["index"] = idx
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+            return [part]
+
+        M = int(np.ceil(N / float(self.point_max)))
+        M = max(1, M)
+
+        if self.mode == "base":
+            return self._base_fragmentation(data_dict, coord, M)
+        elif self.mode == "scanbincrop":
+            return self._scan_bin_crop(data_dict, coord, M)
+        else:
+            raise NotImplementedError(f"Unknown fragmentation mode: {self.mode}")
+
+    def _base_fragmentation(self, data_dict, coord: np.ndarray, M: int):
+        tree = self._cKDTree(coord) if self._cKDTree is not None else None
+
+        centers_idx = self._voxel_anchors(coord, M)
+        fragments, covered = self._fragments_from_centers(
+            data_dict, coord, self.point_max, centers_idx, tree=tree
+        )
+
+        if self.split_mode == "test":
+            fragments = self._ensure_coverage(
+                data_dict=data_dict,
+                coord=coord,
+                point_max=self.point_max,
+                tree=tree,
+                fragments=fragments,
+                covered=covered,
+            )
+
+        return fragments
+
+    def _scan_bin_crop(self, data_dict, coord: np.ndarray, M: int):
+        phi = np.arctan2(coord[:, 1], coord[:, 0]).astype(np.float64)
+        phi = (phi + 2.0 * np.pi) % (2.0 * np.pi)
+
+        edges = np.linspace(self.az_min, self.az_max, M + 1, endpoint=True)
+
+        fragments = []
+        covered = np.zeros(coord.shape[0], dtype=bool)
+
+        bin_indices = []
+        for b in range(M):
+            lo, hi = edges[b], edges[b + 1]
+            if b < M - 1:
+                mask = (phi >= lo) & (phi < hi)
+            else:
+                mask = (phi >= lo) & (phi <= hi)
+            idx_bin = np.where(mask)[0].astype(np.int64)
+            bin_indices.append(idx_bin)
+
+        bin_trees = [None] * M
+        if self._cKDTree is not None:
+            for b in range(M):
+                idx_bin = bin_indices[b]
+                if idx_bin.size > 0:
+                    bin_trees[b] = self._cKDTree(coord[idx_bin])
+
+        for b in range(M):
+            idx_bin = bin_indices[b]
+            if idx_bin.size == 0:
+                continue
+
+            if self.split_mode == "train":
+                a_global = int(self.rng.choice(idx_bin))
+            else: # pick middle element 
+                a_global = int(idx_bin[idx_bin.size // 2])
+
+            idx_sel = self._knn_in_bin(
+                coord=coord,
+                idx_bin=idx_bin,
+                anchor_global=a_global,
+                k=self.point_max,
+                tree_bin=bin_trees[b],
+            )
+
+            part = index_operator(data_dict, idx_sel, duplicate=True)
+            part["index"] = idx_sel
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+            fragments.append(part)
+            covered[idx_sel] = True
+
+        if self.split_mode == "test":
+            fragments, covered = self._ensure_coverage_scanbin(
+                data_dict=data_dict,
+                coord=coord,
+                phi=phi,
+                edges=edges,
+                bin_indices=bin_indices,
+                bin_trees=bin_trees,
+                fragments=fragments,
+                covered=covered,
+            )
+
+        return fragments
+
+    def _knn_in_bin(
+        self,
+        coord: np.ndarray,
+        idx_bin: np.ndarray,
+        anchor_global: int,
+        k: int,
+        tree_bin=None,
+    ) -> np.ndarray:
+
+        if idx_bin.size <= k:
+            return idx_bin.copy()
+
+        anchor = coord[anchor_global]
+
+        if tree_bin is not None:
+            local_anchor = int(np.where(idx_bin == anchor_global)[0][0])
+            _, local_idx = tree_bin.query(coord[idx_bin][local_anchor], k=min(k, idx_bin.size))
+            local_idx = np.array(local_idx, dtype=np.int64)
+            return idx_bin[local_idx]
+
+        # brute force within bin
+        pts = coord[idx_bin]
+        dist2 = np.sum((pts - anchor) ** 2, axis=1)
+        local = np.argpartition(dist2, kth=k - 1)[:k].astype(np.int64)
+        return idx_bin[local]
+
+    def _ensure_coverage_scanbin(
+        self,
+        data_dict,
+        coord: np.ndarray,
+        phi: np.ndarray,
+        edges: np.ndarray,
+        bin_indices: list,
+        bin_trees: list,
+        fragments: list,
+        covered: np.ndarray,
+    ):
+        extra_added = 0
+
+        while extra_added < self.max_extra_fragments:
+            uncovered = np.where(~covered)[0]
+            if uncovered.size == 0:
+                break
+
+            # pick an uncovered point -> find its bin
+            cidx = int(self.rng.choice(uncovered, size=1)[0])
+            p = float(phi[cidx])
+
+            b = int(np.searchsorted(edges, p, side="right") - 1)
+            b = max(0, min(b, len(bin_indices) - 1))
+
+            idx_bin = bin_indices[b]
+            if idx_bin.size == 0:
+                covered[cidx] = True
+                continue
+
+            idx_sel = self._knn_in_bin(
+                coord=coord,
+                idx_bin=idx_bin,
+                anchor_global=cidx,
+                k=self.point_max,
+                tree_bin=bin_trees[b],
+            )
+
+            part = index_operator(data_dict, idx_sel, duplicate=True)
+            part["index"] = idx_sel
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+
+            fragments.append(part)
+            covered[idx_sel] = True
+            extra_added += 1
+
+        return fragments, covered
+
+    def _voxel_anchors(self, coord: np.ndarray, M: int):
+        gs = self.anchor_grid_size
+        if gs <= 0:
+            idx = self.rng.choice(
+                coord.shape[0],
+                size=M,
+                replace=False if M <= coord.shape[0] else True,
+            )
+            return idx.astype(np.int64)
+
+        grid = np.floor(coord / gs).astype(np.int64)
+        grid -= grid.min(0)
+
+        key = GridSample.fnv_hash_vec(grid)
+        idx_sort = np.argsort(key)
+        key_sort = key[idx_sort]
+
+        _, start_idx = np.unique(key_sort, return_index=True)
+        anchors = idx_sort[start_idx]
+
+        if anchors.size >= M:
+            sel = self.rng.choice(anchors.size, size=M, replace=False)
+            centers = anchors[sel]
+        else:
+            need = M - anchors.size
+            extra = self.rng.choice(
+                coord.shape[0],
+                size=need,
+                replace=False if need <= coord.shape[0] else True,
+            )
+            centers = np.concatenate([anchors, extra.astype(np.int64)], axis=0)
+            centers = np.unique(centers)
+
+        self.rng.shuffle(centers)
+        return centers.astype(np.int64)
+
+    def _fragments_from_centers(self, data_dict, coord, point_max, centers_idx, tree=None):
+        fragments = []
+        covered = np.zeros(coord.shape[0], dtype=bool)
+
+        for cidx in centers_idx:
+            idx = self._knn_indices(coord, center_index=int(cidx), k=point_max, tree=tree)
+            idx = np.unique(idx).astype(np.int64)
+            part = index_operator(data_dict, idx, duplicate=True)
+            part["index"] = idx
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+            fragments.append(part)
+            covered[idx] = True
+
+        return fragments, covered
+
+    def _knn_indices(self, coord: np.ndarray, center_index: int, k: int, tree=None) -> np.ndarray:
+        center = coord[center_index]
+        if tree is not None:
+            _, idx = tree.query(center, k=min(k, coord.shape[0]))
+            return np.array(idx, dtype=np.int64)
+
+        dist2 = np.sum((coord - center) ** 2, axis=1)
+        if k >= coord.shape[0]:
+            return np.arange(coord.shape[0], dtype=np.int64)
+        return np.argpartition(dist2, kth=k - 1)[:k].astype(np.int64)
+
+    def _ensure_coverage(self, data_dict, coord, point_max, tree, fragments, covered):
+        extra_added = 0
+        while extra_added < self.max_extra_fragments:
+            uncovered = np.where(~covered)[0]
+            if uncovered.size == 0:
+                break
+
+            cidx = int(self.rng.choice(uncovered, size=1)[0])
+            idx = self._knn_indices(coord, center_index=cidx, k=point_max, tree=tree)
+            idx = np.unique(idx).astype(np.int64)
+
+            part = index_operator(data_dict, idx, duplicate=True)
+            part["index"] = idx
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+
+            fragments.append(part)
+            covered[idx] = True
+            extra_added += 1
+        return fragments
+
+
+
+@TRANSFORMS.register_module()
+class _SceneFragmentation(object):
+    def __init__(
+        self,
+        mode="SphereCrop",          # "SphereCrop" | "ScanBinCrop"
+        split_mode="train",         # "train" | "test"
+        point_max=30000,
+        anchor_grid_size=0.5,       # coarse voxel for anchor selection (meters)
+        seed=None,
+    ):
+        assert mode in ["SphereCrop", "ScanBinCrop"]
+        assert split_mode in ["train", "test"]
+
+        self.mode = mode
+        self.split_mode = split_mode
+        self.point_max = point_max
+        self.anchor_grid_size = float(anchor_grid_size)
+        self.max_extra_fragments = 32
+
+        self.rng = np.random.RandomState(seed) if seed is not None else np.random
+        
+        try:
+            from scipy.spatial import cKDTree
+            self._cKDTree = cKDTree
+        except Exception:
+            self._cKDTree = None
+
+    def __call__(self, data_dict):
+        assert "coord" in data_dict
+        coord = data_dict["coord"]
+        N = int(coord.shape[0])
+        if N == 0:
+            return []
+
+        if self.mode == "ScanBinCrop":
+            raise NotImplementedError
+
+        if N <= self.point_max:
+            idx = np.arange(N, dtype=np.int64)
+            part = index_operator(data_dict, idx, duplicate=True)
+            part["index"] = idx
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+            return [part]
+
+        M = int(np.ceil(N / float(self.point_max)))
+        M = max(1, M)
+
+        tree = self._cKDTree(coord) if self._cKDTree is not None else None
+
+        centers_idx = self._voxel_anchors(coord, M)
+        fragments, covered = self._fragments_from_centers(
+            data_dict, coord, self.point_max, centers_idx, tree=tree
+        )
+
+        if self.split_mode == "test":
+            fragments = self._ensure_coverage(
+                data_dict=data_dict,
+                coord=coord,
+                point_max=self.point_max,
+                tree=tree,
+                fragments=fragments,
+                covered=covered,
+            )
+
+        return fragments
+
+    def _voxel_anchors(self, coord: np.ndarray, M: int):
+        gs = self.anchor_grid_size
+        if gs <= 0: # fallback: pure random
+            idx = self.rng.choice(coord.shape[0], size=M, replace=False if M <= coord.shape[0] else True)
+            return idx.astype(np.int64)
+
+        grid = np.floor(coord / gs).astype(np.int64)
+        grid -= grid.min(0)
+
+        key = GridSample.fnv_hash_vec(grid)
+        idx_sort = np.argsort(key)
+        key_sort = key[idx_sort]
+
+        _, start_idx = np.unique(key_sort, return_index=True)
+        anchors = idx_sort[start_idx]  # one representative per voxel cell
+
+        if anchors.size >= M:
+            sel = self.rng.choice(anchors.size, size=M, replace=False)
+            centers = anchors[sel]
+        else:
+            need = M - anchors.size
+            extra = self.rng.choice(coord.shape[0], size=need, replace=False if need <= coord.shape[0] else True)
+            centers = np.concatenate([anchors, extra.astype(np.int64)], axis=0)
+            centers = np.unique(centers)
+
+
+        self.rng.shuffle(centers)
+        return centers.astype(np.int64)
+
+    def _fragments_from_centers(
+        self,
+        data_dict,
+        coord: np.ndarray,
+        point_max: int,
+        centers_idx: np.ndarray,
+        tree=None,
+    ):
+        fragments = []
+        covered = np.zeros(coord.shape[0], dtype=bool)
+
+        for cidx in centers_idx:
+            idx = self._knn_indices(coord, center_index=int(cidx), k=point_max, tree=tree)
+            idx = np.unique(idx).astype(np.int64)  # keep safe
+            part = index_operator(data_dict, idx, duplicate=True)
+            part["index"] = idx
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+            fragments.append(part)
+            covered[idx] = True
+
+        return fragments, covered
+
+    def _knn_indices(self, coord: np.ndarray, center_index: int, k: int, tree=None) -> np.ndarray:
+        center = coord[center_index]
+        if tree is not None:
+            _, idx = tree.query(center, k=min(k, coord.shape[0]))
+            return np.array(idx, dtype=np.int64)
+
+        # brute force fallback
+        dist2 = np.sum((coord - center) ** 2, axis=1)
+        if k >= coord.shape[0]:
+            return np.arange(coord.shape[0], dtype=np.int64)
+        return np.argpartition(dist2, kth=k - 1)[:k].astype(np.int64)
+
+    def _ensure_coverage(
+        self,
+        data_dict,
+        coord: np.ndarray,
+        point_max: int,
+        tree,
+        fragments: list,
+        covered: np.ndarray,
+    ) -> list:
+        extra_added = 0
+
+        while extra_added < self.max_extra_fragments:
+            uncovered = np.where(~covered)[0]
+            if uncovered.size == 0:
+                break
+
+            cidx = int(self.rng.choice(uncovered, size=1)[0])
+            idx = self._knn_indices(coord, center_index=cidx, k=point_max, tree=tree)
+            idx = np.unique(idx).astype(np.int64)
+
+            part = index_operator(data_dict, idx, duplicate=True)
+            part["index"] = idx
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+
+            fragments.append(part)
+            covered[idx] = True
+            extra_added += 1
+        return fragments
+
+
+### SYSY
+'''
+@TRANSFORMS.register_module()
+class ScanBinCrop(object):
+    def __init__(self, point_max=80000, sample_rate=None, mode="random"):
+        self.point_max = point_max
+        self.sample_rate = sample_rate
+        assert mode in ["random", "center", "all"]
+        self.mode = mode
+
+    def __call__(self, data_dict):
+        point_max = (
+            int(self.sample_rate * data_dict["coord"].shape[0])
+            if self.sample_rate is not None
+            else self.point_max
+        )
+
+        assert "coord" in data_dict.keys()
+        if data_dict["coord"].shape[0] > point_max:
+            if self.mode == "random":
+                center = data_dict["coord"][
+                    np.random.randint(data_dict["coord"].shape[0])
+                ]
+            elif self.mode == "center":
+                center = data_dict["coord"][data_dict["coord"].shape[0] // 2]
+            else:
+                raise NotImplementedError
+            idx_crop = np.argsort(np.sum(np.square(data_dict["coord"] - center), 1))[
+                :point_max
+            ]
+            data_dict = index_operator(data_dict, idx_crop)
+        return data_dict
+'''

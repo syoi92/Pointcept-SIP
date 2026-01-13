@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import pointcept.utils.comm as comm
 from pointcept.utils.misc import intersection_and_union_gpu
+from pointcept.datasets import collate_fn
 
 from .default import HookBase
 from .builder import HOOKS
@@ -621,3 +622,237 @@ class InsSegEvaluator(HookBase):
         self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
         self.trainer.comm_info["current_metric_value"] = all_ap_50  # save for saver
         self.trainer.comm_info["current_metric_name"] = "AP50"  # save for saver
+
+
+@HOOKS.register_module()
+class SIPSemSegEvaluator(HookBase):
+    """
+    SIP fragment-based semantic segmentation evaluator.
+    """
+
+    def __init__(self, write_cls_iou=False, fragment_batch_size=None):
+        self.write_cls_iou = write_cls_iou
+        self.fragment_batch_size = fragment_batch_size  # override cfg.fragment_batch_size if set
+
+    def before_train(self):
+        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
+            wandb.define_metric("val/*", step_metric="Epoch")
+
+    def after_epoch(self):
+        if self.trainer.cfg.evaluate:
+            self.eval()
+
+    def eval(self):
+        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        self.trainer.model.eval()
+
+        num_classes = self.trainer.cfg.data.num_classes
+        ignore_index = self.trainer.cfg.data.ignore_index
+
+        frag_bs = (
+            int(self.fragment_batch_size)
+            if self.fragment_batch_size is not None
+            else int(getattr(self.trainer.cfg, "fragment_batch_size", 1))
+        )
+        frag_bs = max(1, frag_bs)
+
+        # accumulate totals locally, then all_reduce once (less overhead)
+        inter_total = torch.zeros(num_classes, device="cuda", dtype=torch.float64)
+        union_total = torch.zeros(num_classes, device="cuda", dtype=torch.float64)
+        target_total = torch.zeros(num_classes, device="cuda", dtype=torch.float64)
+        loss_sum = 0.0
+        loss_cnt = 0
+
+        with torch.no_grad():
+            for it, batch in enumerate(self.trainer.val_loader):
+                if "fragment_list" not in batch:
+                    raise KeyError(
+                        "SIPSemSegEvaluator expects batch to contain 'fragment_list'. "
+                    )
+
+                scene_fragment_lists = batch["fragment_list"]
+                # scene_fragment_lists is a list (len == batch_size_per_gpu), each item is a fragment list
+                for sidx, fragment_list in enumerate(scene_fragment_lists):
+                    if len(fragment_list) == 0:
+                        continue
+
+                    # Decide whether we can stitch back to scene-level labels
+                    # If any fragment has 'index', we assume all do.
+                    has_index = ("index" in fragment_list[0])
+
+                    if has_index:
+                        # Determine scene size (max index + 1) and (optionally) scene labels
+                        # We use the union of indices; assumes indices are from original scene coordinates.
+                        max_idx = -1
+                        for f in fragment_list:
+                            idx_f = f["index"]
+                            # idx_f might be numpy or torch; normalize
+                            if isinstance(idx_f, torch.Tensor):
+                                max_idx = max(max_idx, int(idx_f.max().item()))
+                            else:
+                                max_idx = max(max_idx, int(np.max(idx_f)))
+                        scene_N = max_idx + 1
+
+                        # pred_score accumulator for voting/averaging
+                        pred_score = torch.zeros((scene_N, num_classes), device="cuda", dtype=torch.float32)
+
+                        # scene segment (if present) for exact metric
+                        # Prefer dataset-provided segment if available in batch; otherwise try fragments.
+                        scene_segment = None
+                        if "segment" in batch:
+                            # could be collated; might be list/array/tensor; SIP collate may already collate it
+                            # we accept list-of-arrays (per scene) if you implemented it that way.
+                            seg_b = batch["segment"]
+                            if isinstance(seg_b, (list, tuple)) and len(seg_b) > sidx:
+                                scene_segment = seg_b[sidx]
+                        if scene_segment is None:
+                            # fallback: build sparse segment using fragment segments where available
+                            # (not perfect if coverage incomplete, but OK for debug)
+                            scene_segment = torch.full((scene_N,), ignore_index, device="cuda", dtype=torch.long)
+
+                    else:
+                        # Fragment-level evaluation (no stitching possible)
+                        scene_segment = None
+
+                    # fragment inference
+                    num_frag_batches = (len(fragment_list) + frag_bs - 1) // frag_bs
+                    for bi in range(num_frag_batches):
+                        s = bi * frag_bs
+                        e = min((bi + 1) * frag_bs, len(fragment_list))
+                        input_dict = collate_fn(fragment_list[s:e])
+
+                        for k, v in input_dict.items():
+                            if isinstance(v, torch.Tensor):
+                                input_dict[k] = v.cuda(non_blocking=True)
+
+                        output_dict = self.trainer.model(input_dict)
+                        logits = output_dict["seg_logits"]  # (n, C)
+                        loss = output_dict.get("loss", None)
+                        if loss is not None:
+                            loss_sum += float(loss.item())
+                            loss_cnt += 1
+
+                        if has_index:
+                            # accumulate softmax scores back to scene indices
+                            prob = torch.softmax(logits, dim=-1)
+
+                            idx_part = input_dict["index"]
+                            # idx_part should be 1D tensor aligned with concatenated points in this frag batch
+                            if not isinstance(idx_part, torch.Tensor):
+                                idx_part = torch.as_tensor(idx_part, device="cuda")
+
+                            # use offset to split fragments inside this batch
+                            bs0 = 0
+                            for be in input_dict["offset"]:
+                                pred_score[idx_part[bs0:be], :] += prob[bs0:be]
+                                bs0 = be
+                        else:
+                            # compute metric per fragment batch directly
+                            pred = logits.argmax(dim=1)
+                            seg = input_dict["segment"]
+                            intersection, union, target = intersection_and_union_gpu(
+                                pred, seg, num_classes, ignore_index
+                            )
+                            inter_total += intersection.to(torch.float64)
+                            union_total += union.to(torch.float64)
+                            target_total += target.to(torch.float64)
+
+                    if has_index:
+                        # finalize scene prediction and compute metrics
+                        pred_scene = pred_score.argmax(dim=1)
+
+                        if not isinstance(scene_segment, torch.Tensor):
+                            scene_segment = torch.as_tensor(scene_segment, device="cuda")
+
+                        intersection, union, target = intersection_and_union_gpu(
+                            pred_scene, scene_segment, num_classes, ignore_index
+                        )
+                        inter_total += intersection.to(torch.float64)
+                        union_total += union.to(torch.float64)
+                        target_total += target.to(torch.float64)
+
+                    self.trainer.logger.info(
+                        f"Val: [{it+1}/{len(self.trainer.val_loader)}] "
+                        f"scene {sidx+1}/{len(scene_fragment_lists)} "
+                        f"frags {len(fragment_list)}"
+                    )
+
+        # DDP sync once
+        if comm.get_world_size() > 1:
+            dist.all_reduce(inter_total)
+            dist.all_reduce(union_total)
+            dist.all_reduce(target_total)
+
+        inter_np = inter_total.cpu().numpy()
+        union_np = union_total.cpu().numpy()
+        target_np = target_total.cpu().numpy()
+
+        iou_class = inter_np / (union_np + 1e-10)
+        acc_class = inter_np / (target_np + 1e-10)
+        m_iou = float(np.mean(iou_class))
+        m_acc = float(np.mean(acc_class))
+        all_acc = float(np.sum(inter_np) / (np.sum(target_np) + 1e-10))
+
+        loss_avg = (loss_sum / max(loss_cnt, 1))
+
+        # write to storage (so other hooks can access)
+        self.trainer.storage.put_scalar("val_loss", loss_avg)
+        self.trainer.storage.put_scalar("val_mIoU", m_iou)
+        self.trainer.storage.put_scalar("val_mAcc", m_acc)
+        self.trainer.storage.put_scalar("val_allAcc", all_acc)
+
+        self.trainer.logger.info(
+            "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.".format(m_iou, m_acc, all_acc)
+        )
+        for i in range(num_classes):
+            self.trainer.logger.info(
+                "Class_{idx}-{name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
+                    idx=i,
+                    name=self.trainer.cfg.data.names[i],
+                    iou=iou_class[i],
+                    accuracy=acc_class[i],
+                )
+            )
+
+        current_epoch = self.trainer.epoch + 1
+        if self.trainer.writer is not None:
+            self.trainer.writer.add_scalar("val/loss", loss_avg, current_epoch)
+            self.trainer.writer.add_scalar("val/mIoU", m_iou, current_epoch)
+            self.trainer.writer.add_scalar("val/mAcc", m_acc, current_epoch)
+            self.trainer.writer.add_scalar("val/allAcc", all_acc, current_epoch)
+            if self.trainer.cfg.enable_wandb:
+                wandb.log(
+                    {
+                        "Epoch": current_epoch,
+                        "val/loss": loss_avg,
+                        "val/mIoU": m_iou,
+                        "val/mAcc": m_acc,
+                        "val/allAcc": all_acc,
+                    },
+                    step=wandb.run.step,
+                )
+            if self.write_cls_iou:
+                for i in range(num_classes):
+                    self.trainer.writer.add_scalar(
+                        f"val/cls_{i}-{self.trainer.cfg.data.names[i]} IoU",
+                        float(iou_class[i]),
+                        current_epoch,
+                    )
+                if self.trainer.cfg.enable_wandb:
+                    for i in range(num_classes):
+                        wandb.log(
+                            {
+                                "Epoch": current_epoch,
+                                f"val/cls_{i}-{self.trainer.cfg.data.names[i]} IoU": float(iou_class[i]),
+                            },
+                            step=wandb.run.step,
+                        )
+
+        self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+        self.trainer.comm_info["current_metric_value"] = m_iou
+        self.trainer.comm_info["current_metric_name"] = "mIoU"
+
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best {}: {:.4f}".format("mIoU", self.trainer.best_metric_value)
+        )

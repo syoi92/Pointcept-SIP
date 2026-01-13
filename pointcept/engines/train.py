@@ -347,3 +347,141 @@ class MultiDatasetTrainer(Trainer):
         )
         self.comm_info["iter_per_epoch"] = len(train_loader)
         return train_loader
+
+
+@TRAINERS.register_module("SIPFragmentTrainer")
+class SIPFragmentTrainer(Trainer):
+    
+    def train(self):
+        return super().train()
+
+    def run_step(self):
+        if version.parse(torch.__version__) >= version.parse("2.4"):
+            auto_cast = partial(torch.amp.autocast, device_type="cuda")
+        else:
+            auto_cast = torch.cuda.amp.autocast
+
+        batch = self.comm_info["input_dict"]
+        assert "fragment_list" in batch
+        scene_fragment_lists = batch["fragment_list"] 
+
+        frag_bs = getattr(self.cfg, "fragment_batch_size", 1)
+
+        total_frag_batches = 0
+        for flist in scene_fragment_lists:
+            total_frag_batches += max(1, (len(flist) + frag_bs - 1) // frag_bs)
+        total_frag_batches = max(1, total_frag_batches)
+
+        self.optimizer.zero_grad(set_to_none=True)
+
+        last_output = None
+
+        for fragment_list in scene_fragment_lists:
+            num_frag_batches = max(1, (len(fragment_list) + frag_bs - 1) // frag_bs)
+
+            # loop fragment batches
+            for i in range(num_frag_batches):
+                s = i * frag_bs
+                e = min((i + 1) * frag_bs, len(fragment_list))
+
+                input_dict = collate_fn(fragment_list[s:e])
+                for k, v in input_dict.items():
+                    if isinstance(v, torch.Tensor):
+                        input_dict[k] = v.cuda(non_blocking=True)
+
+                with auto_cast(enabled=self.cfg.enable_amp, dtype=AMP_DTYPE[self.cfg.amp_dtype]):
+                    output_dict = self.model(input_dict)
+                    loss = output_dict["loss"] / num_frag_batches  # scale so total ~1 scene
+
+                if self.cfg.enable_amp:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                
+                last_output = output_dict
+
+        # optimizer step
+        if self.cfg.enable_amp:
+            self.scaler.unscale_(self.optimizer)
+            if self.cfg.clip_grad is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_grad)
+            self.scaler.step(self.optimizer)
+
+            scaler = self.scaler.get_scale()
+            self.scaler.update()
+            if scaler <= self.scaler.get_scale():
+                self.scheduler.step()
+        else:
+            if self.cfg.clip_grad is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_grad)
+            self.optimizer.step()
+            self.scheduler.step()
+
+        if self.cfg.empty_cache:
+            torch.cuda.empty_cache()
+
+        if last_output is not None:
+            self.comm_info["model_output_dict"] = last_output
+
+    def build_train_loader(self):
+        train_data = build_dataset(self.cfg.data.train)
+
+        if comm.get_world_size() > 1:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_data)
+        else:
+            train_sampler = None
+
+        init_fn = (
+            partial(
+                worker_init_fn,
+                num_workers=self.cfg.num_worker_per_gpu,
+                rank=comm.get_rank(),
+                seed=self.cfg.seed,
+            )
+            if self.cfg.seed is not None
+            else None
+        )
+
+        return torch.utils.data.DataLoader(
+            train_data,
+            batch_size=self.cfg.batch_size_per_gpu,
+            shuffle=(train_sampler is None),
+            num_workers=self.cfg.num_worker_per_gpu,
+            sampler=train_sampler,
+            collate_fn=self._sip_collate_fn,
+            pin_memory=True,
+            worker_init_fn=init_fn,
+            drop_last=len(train_data) > self.cfg.batch_size,
+            persistent_workers=True,
+        )
+
+    def build_val_loader(self):
+        if not self.cfg.evaluate:
+            return None
+
+        val_data = build_dataset(self.cfg.data.val)
+        if comm.get_world_size() > 1:
+            val_sampler = torch.utils.data.distributed.DistributedSampler(val_data)
+        else:
+            val_sampler = None
+
+        return torch.utils.data.DataLoader(
+            val_data,
+            batch_size=self.cfg.batch_size_val_per_gpu,
+            shuffle=False,
+            num_workers=self.cfg.num_worker_per_gpu,
+            pin_memory=True,
+            sampler=val_sampler,
+            collate_fn=self._sip_collate_fn,
+        )
+    
+    @staticmethod
+    def _sip_collate_fn(batch):
+        out = {}
+        for k in batch[0].keys():
+            if k == "fragment_list":
+                out[k] = [b[k] for b in batch]  # list of fragment_lists (one per scene)
+            else:
+                out[k] = collate_fn([b[k] for b in batch])
+        return out
+
