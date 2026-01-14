@@ -1212,19 +1212,28 @@ class Identity(object):
 class SceneSampling(object):
     def __init__(
         self,
-        mode="grid",               # "random" | "grid" | "thinning"
+        mode="grid",               # "random" | "grid" | "thinning"  
         keep_ratio=None,           # float in (0, 1]
         grid_equiv_size=0.05,      # float (meters) for anchor ratio estimation
         grid_size=0.05,            # grid size used in grid mode (if grid_equiv_size is None)
         seed=None,
+        k_feat=16,
+        w_curv=1.0,
+        w_planar=0.2,
+        w_lin=1.2,
+        clip_low=1.0,              
+        clip_high=99.0,
+        query_chunk=200000,        # chunk size for kNN query to control memory
     ):
-        assert mode in ["random", "grid", "thinning"]
-        self.mode = mode
+        self.mode = str(mode).lower()
+        assert self.mode in ["random", "grid", "thinning"], f"Unknown mode: {mode}"
+
         self.keep_ratio = keep_ratio
         self.grid_equiv_size = grid_equiv_size
-        
+
         self.rng = np.random.RandomState(seed) if seed is not None else np.random
 
+        # grid sampler
         if self.mode == "grid":
             self.grid_size = grid_size
             self._grid_sampler = GridSample(
@@ -1235,12 +1244,27 @@ class SceneSampling(object):
                 return_grid_coord=True,
             )
 
+        # thinning params
+        self.k_feat = int(k_feat)
+        self.w_curv = float(w_curv)
+        self.w_planar = float(w_planar)
+        self.w_lin = float(w_lin)
+        self.clip_low = float(clip_low)
+        self.clip_high = float(clip_high)
+        self.query_chunk = int(query_chunk)
+
+        try:
+            from scipy.spatial import cKDTree
+            self._cKDTree = cKDTree
+        except Exception:
+            self._cKDTree = None
+
     def __call__(self, data_dict):
         assert "coord" in data_dict, "No 'coord' in data"
         N = int(data_dict["coord"].shape[0])
         if N == 0:
             return data_dict
-        
+
         if self.mode == "grid":
             return self._grid_mode(data_dict)
 
@@ -1253,9 +1277,9 @@ class SceneSampling(object):
         if self.mode == "random":
             return self._random_mode(data_dict, r)
 
-        # if self.mode == "thinning":
-        #     raise NotImplementedError
-        
+        if self.mode == "thinning":
+            return self._thinning_mode(data_dict, r)
+
         raise NotImplementedError
 
     def _clip_ratio(self, r: float):
@@ -1264,7 +1288,6 @@ class SceneSampling(object):
     def _apply_margin(self, r: float):  # relative margin (+/-5%)
         ratio_margin = 0.05
         r = self._clip_ratio(r)
-
         lo = self._clip_ratio(r * (1.0 - ratio_margin))
         hi = self._clip_ratio(r * (1.0 + ratio_margin))
         if hi <= lo:
@@ -1274,7 +1297,9 @@ class SceneSampling(object):
     def _resolve_keep_ratio(self, data_dict):
         if self.keep_ratio is not None:
             return self._clip_ratio(float(self.keep_ratio))
-        return self._clip_ratio(self._estimate_grid_equiv_ratio(data_dict, float(self.grid_equiv_size)))
+        return self._clip_ratio(
+            self._estimate_grid_equiv_ratio(data_dict, float(self.grid_equiv_size))
+        )
 
     def _estimate_grid_equiv_ratio(self, data_dict, grid_size: float):
         coord = data_dict["coord"]
@@ -1286,16 +1311,123 @@ class SceneSampling(object):
         return float(num_vox) / float(coord.shape[0])
 
     def _grid_mode(self, data_dict):
-        out = self._grid_sampler(data_dict)
-        return out
+        return self._grid_sampler(data_dict)
 
     def _random_mode(self, data_dict, r_target: float):
         N = int(data_dict["coord"].shape[0])
         K = int(np.clip(np.round(r_target * N), 1, N))
         idx = self.rng.choice(N, size=K, replace=False)
         idx.sort()
-        out = index_operator(data_dict, idx)
-        return out
+        return index_operator(data_dict, idx)
+
+    # ----------------- thinning core -----------------
+
+    @staticmethod
+    def _robust_01(x: np.ndarray, low: float = 1.0, high: float = 99.0):
+        lo, hi = np.percentile(x, [low, high])
+        if not np.isfinite(lo):
+            lo = np.nanmin(x)
+        if not np.isfinite(hi):
+            hi = np.nanmax(x)
+        if hi <= lo:
+            return np.zeros_like(x, dtype=np.float64), float(lo), float(hi)
+        y = np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+        return y.astype(np.float64), float(lo), float(hi)
+
+    @staticmethod
+    def _calibrated_probabilities(scores_01: np.ndarray, keep_ratio: float) -> np.ndarray:
+        r = float(keep_ratio)
+        s = scores_01.astype(np.float64)
+        mu = float(np.mean(s))
+        eps = 1e-12
+        if mu <= eps or (1.0 - mu) <= eps:
+            return np.full_like(s, r, dtype=np.float64)
+        a1 = r / mu
+        a2 = (1.0 - r) / (1.0 - mu)
+        a = min(a1, a2)
+        b = r - a * mu
+        return np.clip(a * s + b, 0.0, 1.0)
+
+    def _bernoulli_keep(self, p: np.ndarray) -> np.ndarray:
+        return self.rng.random(p.shape[0]) < p
+
+    def _thinning_mode(self, data_dict, r_target: float):
+        coord = data_dict["coord"].astype(np.float64, copy=False)
+        N = int(coord.shape[0])
+        k = int(self.k_feat)
+        if k < 3 or N <= 1:
+            return data_dict
+
+        curv = np.empty(N, dtype=np.float64)
+        plan = np.empty(N, dtype=np.float64)
+        lin  = np.empty(N, dtype=np.float64)
+
+        if self._cKDTree is not None:
+            tree = self._cKDTree(coord)
+            # chunked query to avoid allocating Nx(k+1) all at once for huge N
+            step = max(1, int(self.query_chunk))
+            for s in range(0, N, step):
+                e = min(N, s + step)
+                d, idx = tree.query(coord[s:e], k=min(k + 1, N), workers=-1)
+                if idx.ndim == 1:
+                    idx = idx[:, None]
+                idx_nbr = idx[:, 1:]  # drop self
+                nbr = coord[idx_nbr]  # (B, k, 3)
+
+                # covariance in batch
+                X = nbr - nbr.mean(axis=1, keepdims=True)            # (B,k,3)
+                C = np.einsum("bki,bkj->bij", X, X) / max(k - 1, 1)  # (B,3,3)
+                w = np.linalg.eigvalsh(C)                             # (B,3) ascending
+                w = w[:, ::-1]                                        # λ1 ≥ λ2 ≥ λ3
+
+                l1, l2, l3 = w[:, 0], w[:, 1], w[:, 2]
+                ssum = l1 + l2 + l3
+                eps = 1e-12
+                curv[s:e] = np.where(ssum > 0, l3 / (ssum + eps), 0.0)
+                plan[s:e] = np.where(l1 > 0, (l2 - l3) / (l1 + eps), 0.0)
+                lin[s:e]  = np.where(l1 > 0, (l1 - l2) / (l1 + eps), 0.0)
+
+        else:
+            # fallback: Open3D KDTreeFlann per-point loop (slow but works)
+            import open3d as o3d
+            pcd_tmp = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(coord))
+            kdt = o3d.geometry.KDTreeFlann(pcd_tmp)
+            eps = 1e-12
+            for i in range(N):
+                _, idxs, _ = kdt.search_knn_vector_3d(coord[i], min(k + 1, N))
+                if len(idxs) <= 1:
+                    curv[i] = plan[i] = lin[i] = 0.0
+                    continue
+                nbr = coord[np.asarray(idxs[1:], dtype=np.int64)]
+                X = nbr - nbr.mean(axis=0, keepdims=True)
+                if X.shape[0] <= 1:
+                    curv[i] = plan[i] = lin[i] = 0.0
+                    continue
+                C = (X.T @ X) / (X.shape[0] - 1)
+                w = np.linalg.eigvalsh(C)[::-1]
+                l1, l2, l3 = w[0], w[1], w[2]
+                ssum = l1 + l2 + l3
+                curv[i] = (l3 / (ssum + eps)) if ssum > 0 else 0.0
+                plan[i] = ((l2 - l3) / (l1 + eps)) if l1 > 0 else 0.0
+                lin[i]  = ((l1 - l2) / (l1 + eps)) if l1 > 0 else 0.0
+
+        curv01, _, _ = self._robust_01(curv, low=self.clip_low, high=self.clip_high)
+        plan01, _, _ = self._robust_01(plan, low=self.clip_low, high=self.clip_high)
+        lin01,  _, _ = self._robust_01(lin,  low=self.clip_low, high=self.clip_high)
+
+        edge_like = np.maximum(self.w_curv * curv01, self.w_lin * lin01)
+        score = edge_like - (self.w_planar * plan01)
+
+        score01, _, _ = self._robust_01(score, low=0.0, high=100.0)
+        probs = self._calibrated_probabilities(score01, keep_ratio=r_target)
+        keep_mask = self._bernoulli_keep(probs)
+
+        if not np.any(keep_mask):
+            keep_mask[self.rng.randint(0, N)] = True
+
+        idx = np.nonzero(keep_mask)[0].astype(np.int64)
+        idx.sort()
+        return index_operator(data_dict, idx)
 
 
 @TRANSFORMS.register_module()
@@ -1373,7 +1505,6 @@ class SceneFragmentation(object):
                 fragments=fragments,
                 covered=covered,
             )
-
         return fragments
 
     def _scan_bin_crop(self, data_dict, coord: np.ndarray, M: int):
@@ -1599,201 +1730,3 @@ class SceneFragmentation(object):
             covered[idx] = True
             extra_added += 1
         return fragments
-
-
-
-@TRANSFORMS.register_module()
-class _SceneFragmentation(object):
-    def __init__(
-        self,
-        mode="SphereCrop",          # "SphereCrop" | "ScanBinCrop"
-        split_mode="train",         # "train" | "test"
-        point_max=30000,
-        anchor_grid_size=0.5,       # coarse voxel for anchor selection (meters)
-        seed=None,
-    ):
-        assert mode in ["SphereCrop", "ScanBinCrop"]
-        assert split_mode in ["train", "test"]
-
-        self.mode = mode
-        self.split_mode = split_mode
-        self.point_max = point_max
-        self.anchor_grid_size = float(anchor_grid_size)
-        self.max_extra_fragments = 32
-
-        self.rng = np.random.RandomState(seed) if seed is not None else np.random
-        
-        try:
-            from scipy.spatial import cKDTree
-            self._cKDTree = cKDTree
-        except Exception:
-            self._cKDTree = None
-
-    def __call__(self, data_dict):
-        assert "coord" in data_dict
-        coord = data_dict["coord"]
-        N = int(coord.shape[0])
-        if N == 0:
-            return []
-
-        if self.mode == "ScanBinCrop":
-            raise NotImplementedError
-
-        if N <= self.point_max:
-            idx = np.arange(N, dtype=np.int64)
-            part = index_operator(data_dict, idx, duplicate=True)
-            part["index"] = idx
-            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
-                part["index_valid_keys"].append("index")
-            return [part]
-
-        M = int(np.ceil(N / float(self.point_max)))
-        M = max(1, M)
-
-        tree = self._cKDTree(coord) if self._cKDTree is not None else None
-
-        centers_idx = self._voxel_anchors(coord, M)
-        fragments, covered = self._fragments_from_centers(
-            data_dict, coord, self.point_max, centers_idx, tree=tree
-        )
-
-        if self.split_mode == "test":
-            fragments = self._ensure_coverage(
-                data_dict=data_dict,
-                coord=coord,
-                point_max=self.point_max,
-                tree=tree,
-                fragments=fragments,
-                covered=covered,
-            )
-
-        return fragments
-
-    def _voxel_anchors(self, coord: np.ndarray, M: int):
-        gs = self.anchor_grid_size
-        if gs <= 0: # fallback: pure random
-            idx = self.rng.choice(coord.shape[0], size=M, replace=False if M <= coord.shape[0] else True)
-            return idx.astype(np.int64)
-
-        grid = np.floor(coord / gs).astype(np.int64)
-        grid -= grid.min(0)
-
-        key = GridSample.fnv_hash_vec(grid)
-        idx_sort = np.argsort(key)
-        key_sort = key[idx_sort]
-
-        _, start_idx = np.unique(key_sort, return_index=True)
-        anchors = idx_sort[start_idx]  # one representative per voxel cell
-
-        if anchors.size >= M:
-            sel = self.rng.choice(anchors.size, size=M, replace=False)
-            centers = anchors[sel]
-        else:
-            need = M - anchors.size
-            extra = self.rng.choice(coord.shape[0], size=need, replace=False if need <= coord.shape[0] else True)
-            centers = np.concatenate([anchors, extra.astype(np.int64)], axis=0)
-            centers = np.unique(centers)
-
-
-        self.rng.shuffle(centers)
-        return centers.astype(np.int64)
-
-    def _fragments_from_centers(
-        self,
-        data_dict,
-        coord: np.ndarray,
-        point_max: int,
-        centers_idx: np.ndarray,
-        tree=None,
-    ):
-        fragments = []
-        covered = np.zeros(coord.shape[0], dtype=bool)
-
-        for cidx in centers_idx:
-            idx = self._knn_indices(coord, center_index=int(cidx), k=point_max, tree=tree)
-            idx = np.unique(idx).astype(np.int64)  # keep safe
-            part = index_operator(data_dict, idx, duplicate=True)
-            part["index"] = idx
-            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
-                part["index_valid_keys"].append("index")
-            fragments.append(part)
-            covered[idx] = True
-
-        return fragments, covered
-
-    def _knn_indices(self, coord: np.ndarray, center_index: int, k: int, tree=None) -> np.ndarray:
-        center = coord[center_index]
-        if tree is not None:
-            _, idx = tree.query(center, k=min(k, coord.shape[0]))
-            return np.array(idx, dtype=np.int64)
-
-        # brute force fallback
-        dist2 = np.sum((coord - center) ** 2, axis=1)
-        if k >= coord.shape[0]:
-            return np.arange(coord.shape[0], dtype=np.int64)
-        return np.argpartition(dist2, kth=k - 1)[:k].astype(np.int64)
-
-    def _ensure_coverage(
-        self,
-        data_dict,
-        coord: np.ndarray,
-        point_max: int,
-        tree,
-        fragments: list,
-        covered: np.ndarray,
-    ) -> list:
-        extra_added = 0
-
-        while extra_added < self.max_extra_fragments:
-            uncovered = np.where(~covered)[0]
-            if uncovered.size == 0:
-                break
-
-            cidx = int(self.rng.choice(uncovered, size=1)[0])
-            idx = self._knn_indices(coord, center_index=cidx, k=point_max, tree=tree)
-            idx = np.unique(idx).astype(np.int64)
-
-            part = index_operator(data_dict, idx, duplicate=True)
-            part["index"] = idx
-            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
-                part["index_valid_keys"].append("index")
-
-            fragments.append(part)
-            covered[idx] = True
-            extra_added += 1
-        return fragments
-
-
-### SYSY
-'''
-@TRANSFORMS.register_module()
-class ScanBinCrop(object):
-    def __init__(self, point_max=80000, sample_rate=None, mode="random"):
-        self.point_max = point_max
-        self.sample_rate = sample_rate
-        assert mode in ["random", "center", "all"]
-        self.mode = mode
-
-    def __call__(self, data_dict):
-        point_max = (
-            int(self.sample_rate * data_dict["coord"].shape[0])
-            if self.sample_rate is not None
-            else self.point_max
-        )
-
-        assert "coord" in data_dict.keys()
-        if data_dict["coord"].shape[0] > point_max:
-            if self.mode == "random":
-                center = data_dict["coord"][
-                    np.random.randint(data_dict["coord"].shape[0])
-                ]
-            elif self.mode == "center":
-                center = data_dict["coord"][data_dict["coord"].shape[0] // 2]
-            else:
-                raise NotImplementedError
-            idx_crop = np.argsort(np.sum(np.square(data_dict["coord"] - center), 1))[
-                :point_max
-            ]
-            data_dict = index_operator(data_dict, idx_crop)
-        return data_dict
-'''
