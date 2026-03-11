@@ -793,6 +793,10 @@ class SIPSemSegEvaluator(HookBase):
         m_acc = float(np.mean(acc_class))
         all_acc = float(np.sum(inter_np) / (np.sum(target_np) + 1e-10))
 
+        obj_class_ids = [3, 4, 5]
+        obj_iou = iou_class[obj_class_ids]
+        m_iou_obj = float(np.mean(obj_iou))   # group metric - cnst objs
+
         loss_avg = (loss_sum / max(loss_cnt, 1))
 
         # write to storage (so other hooks can access)
@@ -849,8 +853,10 @@ class SIPSemSegEvaluator(HookBase):
                         )
 
         self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
-        self.trainer.comm_info["current_metric_value"] = m_iou
-        self.trainer.comm_info["current_metric_name"] = "mIoU"
+        # self.trainer.comm_info["current_metric_value"] = m_iou
+        # self.trainer.comm_info["current_metric_name"] = "mIoU"
+        self.trainer.comm_info["current_metric_value"] = m_iou_obj
+        self.trainer.comm_info["current_metric_name"] = "mIoU_partial"
 
     def after_train(self):
         self.trainer.logger.info(

@@ -391,7 +391,7 @@ class SIPFragmentTrainer(Trainer):
 
                 with auto_cast(enabled=self.cfg.enable_amp, dtype=AMP_DTYPE[self.cfg.amp_dtype]):
                     output_dict = self.model(input_dict)
-                    loss = output_dict["loss"] / num_frag_batches  # scale so total ~1 scene
+                    loss = output_dict["loss"] #/ num_frag_batches  # scale so total ~1 scene
 
                 if self.cfg.enable_amp:
                     self.scaler.scale(loss).backward()

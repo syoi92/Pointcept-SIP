@@ -124,7 +124,7 @@ def _lovasz_softmax_flat(probas, labels, classes="present", class_seen=None):
     """
     if probas.numel() == 0:
         # only void pixels, the gradients should be 0
-        return probas * 0.0
+        return probas.sum() * 0.0 # probas * 0.0
     C = probas.size(1)
     losses = []
     class_to_sum = list(range(C)) if classes in ["all", "present"] else classes
@@ -161,6 +161,8 @@ def _lovasz_softmax_flat(probas, labels, classes="present", class_seen=None):
                 perm = perm.data
                 fg_sorted = fg[perm]
                 losses.append(torch.dot(errors_sorted, _lovasz_grad(fg_sorted)))
+    if len(losses) == 0:
+        return probas.sum() * 0.0
     return mean(losses)
 
 

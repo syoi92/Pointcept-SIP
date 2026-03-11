@@ -1208,34 +1208,42 @@ class Identity(object):
         return data_dict
 
 
+import numpy as np
+
+from pointcept.datasets.transform import TRANSFORMS
+from pointcept.datasets.transform import GridSample
+from pointcept.datasets.transform import index_operator
+
+
 @TRANSFORMS.register_module()
 class SceneSampling(object):
     def __init__(
         self,
-        mode="grid",               # "random" | "grid" | "thinning"  
+        mode="grid",               # "random" | "grid" | "thinning"
         keep_ratio=None,           # float in (0, 1]
         grid_equiv_size=0.05,      # float (meters) for anchor ratio estimation
         grid_size=0.05,            # grid size used in grid mode (if grid_equiv_size is None)
         seed=None,
         k_feat=16,
         w_curv=1.0,
-        w_planar=0.2,
-        w_lin=1.2,
-        clip_low=1.0,              
-        clip_high=99.0,
+        w_planar=0.4,
+        w_lin=0.3,
         query_chunk=200000,        # chunk size for kNN query to control memory
+        # density dilution
+        use_density_dilution=True,
+        gamma=4.0,
+        dmin=0.1,
     ):
         self.mode = str(mode).lower()
         assert self.mode in ["random", "grid", "thinning"], f"Unknown mode: {mode}"
 
         self.keep_ratio = keep_ratio
         self.grid_equiv_size = grid_equiv_size
-
         self.rng = np.random.RandomState(seed) if seed is not None else np.random
 
         # grid sampler
         if self.mode == "grid":
-            self.grid_size = grid_size
+            self.grid_size = float(grid_size)
             self._grid_sampler = GridSample(
                 grid_size=self.grid_size,
                 hash_type="fnv",
@@ -1249,9 +1257,11 @@ class SceneSampling(object):
         self.w_curv = float(w_curv)
         self.w_planar = float(w_planar)
         self.w_lin = float(w_lin)
-        self.clip_low = float(clip_low)
-        self.clip_high = float(clip_high)
         self.query_chunk = int(query_chunk)
+
+        self.use_density_dilution = bool(use_density_dilution)
+        self.gamma = float(gamma)
+        self.dmin = float(dmin)
 
         try:
             from scipy.spatial import cKDTree
@@ -1285,7 +1295,7 @@ class SceneSampling(object):
     def _clip_ratio(self, r: float):
         return float(np.clip(r, 1e-6, 1.0))
 
-    def _apply_margin(self, r: float):  # relative margin (+/-5%)
+    def _apply_margin(self, r: float):
         ratio_margin = 0.05
         r = self._clip_ratio(r)
         lo = self._clip_ratio(r * (1.0 - ratio_margin))
@@ -1323,7 +1333,7 @@ class SceneSampling(object):
     # ----------------- thinning core -----------------
 
     @staticmethod
-    def _robust_01(x: np.ndarray, low: float = 1.0, high: float = 99.0):
+    def _robust_01(x: np.ndarray, low: float, high: float):
         lo, hi = np.percentile(x, [low, high])
         if not np.isfinite(lo):
             lo = np.nanmin(x)
@@ -1331,7 +1341,7 @@ class SceneSampling(object):
             hi = np.nanmax(x)
         if hi <= lo:
             return np.zeros_like(x, dtype=np.float64), float(lo), float(hi)
-        y = np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+        y = np.clip((x - lo) / (hi - lo + 1e-12), 0.0, 1.0)
         return y.astype(np.float64), float(lo), float(hi)
 
     @staticmethod
@@ -1360,66 +1370,102 @@ class SceneSampling(object):
 
         curv = np.empty(N, dtype=np.float64)
         plan = np.empty(N, dtype=np.float64)
-        lin  = np.empty(N, dtype=np.float64)
+        lin = np.empty(N, dtype=np.float64)
+        rho = np.empty(N, dtype=np.float64)  # proxy density
+
+        eps = 1e-12
 
         if self._cKDTree is not None:
             tree = self._cKDTree(coord)
-            # chunked query to avoid allocating Nx(k+1) all at once for huge N
             step = max(1, int(self.query_chunk))
             for s in range(0, N, step):
                 e = min(N, s + step)
-                d, idx = tree.query(coord[s:e], k=min(k + 1, N), workers=-1)
+                kk = min(k + 1, N)
+                d, idx = tree.query(coord[s:e], k=kk, workers=-1)
+
                 if idx.ndim == 1:
                     idx = idx[:, None]
+                    d = d[:, None]
+
                 idx_nbr = idx[:, 1:]  # drop self
+                d_nbr = d[:, 1:]      # drop self distance
+
+                # proxy density: 1 / mean neighbor distance
+                mdist = d_nbr.mean(axis=1) if d_nbr.shape[1] > 0 else np.zeros(e - s)
+                rho[s:e] = 1.0 / (mdist + eps)
+
                 nbr = coord[idx_nbr]  # (B, k, 3)
 
-                # covariance in batch
-                X = nbr - nbr.mean(axis=1, keepdims=True)            # (B,k,3)
-                C = np.einsum("bki,bkj->bij", X, X) / max(k - 1, 1)  # (B,3,3)
-                w = np.linalg.eigvalsh(C)                             # (B,3) ascending
-                w = w[:, ::-1]                                        # λ1 ≥ λ2 ≥ λ3
+                X = nbr - nbr.mean(axis=1, keepdims=True)                 # (B,k,3)
+                C = np.einsum("bki,bkj->bij", X, X) / max(k - 1, 1)       # (B,3,3)
+                w = np.linalg.eigvalsh(C)                                  # (B,3) asc
+                w = w[:, ::-1]                                             # λ1 ≥ λ2 ≥ λ3
 
                 l1, l2, l3 = w[:, 0], w[:, 1], w[:, 2]
                 ssum = l1 + l2 + l3
-                eps = 1e-12
+
                 curv[s:e] = np.where(ssum > 0, l3 / (ssum + eps), 0.0)
                 plan[s:e] = np.where(l1 > 0, (l2 - l3) / (l1 + eps), 0.0)
                 lin[s:e]  = np.where(l1 > 0, (l1 - l2) / (l1 + eps), 0.0)
 
         else:
-            # fallback: Open3D KDTreeFlann per-point loop (slow but works)
             import open3d as o3d
             pcd_tmp = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(coord))
             kdt = o3d.geometry.KDTreeFlann(pcd_tmp)
-            eps = 1e-12
+
             for i in range(N):
-                _, idxs, _ = kdt.search_knn_vector_3d(coord[i], min(k + 1, N))
+                _, idxs, d2 = kdt.search_knn_vector_3d(coord[i], min(k + 1, N))
                 if len(idxs) <= 1:
                     curv[i] = plan[i] = lin[i] = 0.0
+                    rho[i] = 0.0
                     continue
+
+                d2 = np.asarray(d2, dtype=np.float64)
+                d_nbr = np.sqrt(d2[1:])  # exclude self
+                mdist = float(d_nbr.mean()) if d_nbr.size else 0.0
+                rho[i] = 1.0 / (mdist + eps)
+
                 nbr = coord[np.asarray(idxs[1:], dtype=np.int64)]
                 X = nbr - nbr.mean(axis=0, keepdims=True)
                 if X.shape[0] <= 1:
                     curv[i] = plan[i] = lin[i] = 0.0
                     continue
+
                 C = (X.T @ X) / (X.shape[0] - 1)
                 w = np.linalg.eigvalsh(C)[::-1]
                 l1, l2, l3 = w[0], w[1], w[2]
                 ssum = l1 + l2 + l3
+
                 curv[i] = (l3 / (ssum + eps)) if ssum > 0 else 0.0
                 plan[i] = ((l2 - l3) / (l1 + eps)) if l1 > 0 else 0.0
                 lin[i]  = ((l1 - l2) / (l1 + eps)) if l1 > 0 else 0.0
 
-        curv01, _, _ = self._robust_01(curv, low=self.clip_low, high=self.clip_high)
-        plan01, _, _ = self._robust_01(plan, low=self.clip_low, high=self.clip_high)
-        lin01,  _, _ = self._robust_01(lin,  low=self.clip_low, high=self.clip_high)
+        # Fixed robust normalization bounds (algorithmic constants)
+        curv01, _, _ = self._robust_01(curv, low=1.0, high=99.0)
+        plan01, _, _ = self._robust_01(plan, low=1.0, high=99.0)
+        lin01,  _, _ = self._robust_01(lin,  low=1.0, high=99.0)
 
-        edge_like = np.maximum(self.w_curv * curv01, self.w_lin * lin01)
+        edge_like = self.w_curv * curv01 + self.w_lin * lin01
         score = edge_like - (self.w_planar * plan01)
 
+        # score normalization uses full range by design
         score01, _, _ = self._robust_01(score, low=0.0, high=100.0)
-        probs = self._calibrated_probabilities(score01, keep_ratio=r_target)
+
+        if self.use_density_dilution:
+            rho_valid = rho[np.isfinite(rho)]
+            rho_med = float(np.median(rho_valid)) if rho_valid.size > 0 else 0.0
+
+            if rho_med <= eps:
+                d_factor = np.ones_like(score01, dtype=np.float64)
+            else:
+                d_factor = 1.0 / (1.0 + self.gamma * (rho / (rho_med + eps)))
+                d_factor = np.clip(d_factor, self.dmin, 1.0)
+
+            combined01 = np.clip(score01 * d_factor, 0.0, 1.0)
+        else:
+            combined01 = score01
+
+        probs = self._calibrated_probabilities(combined01, keep_ratio=r_target)
         keep_mask = self._bernoulli_keep(probs)
 
         if not np.any(keep_mask):
@@ -1431,7 +1477,7 @@ class SceneSampling(object):
 
 
 @TRANSFORMS.register_module()
-class SceneFragmentation(object):
+class SceneFragmentation2(object):
     def __init__(
         self,
         mode="base",               # "base" | "ScanBinCrop"
@@ -1440,6 +1486,11 @@ class SceneFragmentation(object):
         anchor_grid_size=0.5,      # used only in base mode anchor selection
         seed=None,
         azimuth_range=(0.0, 2.0 * np.pi),  # bins over [0, 2pi) by default
+
+        max_radius=5,           
+        min_points=2048,          
+        resample_trials=5,            #  how many times to resample anchor if too few points
+        max_train_extra_fragments=32, # allow extra fragments in train when radius cap reduces coverage
     ):
         assert mode.lower() in ["base", "scanbincrop", "spherecrop"]
         assert split_mode in ["train", "test"]
@@ -1461,6 +1512,11 @@ class SceneFragmentation(object):
             self._cKDTree = cKDTree
         except Exception:
             self._cKDTree = None
+
+        self.max_radius = None if max_radius is None else float(max_radius)
+        self.min_points = int(min_points)
+        self.resample_trials = int(resample_trials)
+        self.max_train_extra_fragments = int(max_train_extra_fragments)
 
     def __call__(self, data_dict):
         assert "coord" in data_dict
@@ -1492,8 +1548,8 @@ class SceneFragmentation(object):
         tree = self._cKDTree(coord) if self._cKDTree is not None else None
 
         centers_idx = self._voxel_anchors(coord, M)
-        fragments, covered = self._fragments_from_centers(
-            data_dict, coord, self.point_max, centers_idx, tree=tree
+        fragments, covered = self._fragments_from_centers(  # [CHANGED] now uses radius/min_points/resampling
+            data_dict, coord, self.point_max, centers_idx, tree=tree, target_M=M
         )
 
         if self.split_mode == "test":
@@ -1538,18 +1594,15 @@ class SceneFragmentation(object):
             if idx_bin.size == 0:
                 continue
 
-            if self.split_mode == "train":
-                a_global = int(self.rng.choice(idx_bin))
-            else: # pick middle element 
-                a_global = int(idx_bin[idx_bin.size // 2])
-
-            idx_sel = self._knn_in_bin(
+            idx_sel = self._select_fragment_in_bin(
                 coord=coord,
                 idx_bin=idx_bin,
-                anchor_global=a_global,
-                k=self.point_max,
                 tree_bin=bin_trees[b],
+                prefer_middle=(self.split_mode != "train"),
             )
+
+            if idx_sel is None or idx_sel.size == 0:
+                continue
 
             part = index_operator(data_dict, idx_sel, duplicate=True)
             part["index"] = idx_sel
@@ -1557,6 +1610,19 @@ class SceneFragmentation(object):
                 part["index_valid_keys"].append("index")
             fragments.append(part)
             covered[idx_sel] = True
+
+        if self.split_mode == "train":
+            fragments, covered = self._ensure_min_fragments_scanbin(
+                data_dict=data_dict,
+                coord=coord,
+                phi=phi,
+                edges=edges,
+                bin_indices=bin_indices,
+                bin_trees=bin_trees,
+                fragments=fragments,
+                covered=covered,
+                target_M=M,
+            )
 
         if self.split_mode == "test":
             fragments, covered = self._ensure_coverage_scanbin(
@@ -1571,6 +1637,114 @@ class SceneFragmentation(object):
             )
 
         return fragments
+
+    def _radius_filter(self, coord: np.ndarray, anchor_global: int, idx: np.ndarray) -> np.ndarray:
+        """Filter indices by max_radius around anchor. If max_radius is None -> no-op."""  # [CHANGED]
+        if self.max_radius is None or idx.size == 0:
+            return idx
+        a = coord[anchor_global]
+        pts = coord[idx]
+        dist2 = np.sum((pts - a) ** 2, axis=1)
+        keep = dist2 <= (self.max_radius ** 2)
+        return idx[keep]
+
+    def _select_fragment_in_bin(self, coord, idx_bin, tree_bin, prefer_middle=False):
+        """Pick an anchor in bin (with resampling) and return selected indices (radius+min_points applied)."""  # [CHANGED]
+        if idx_bin.size == 0:
+            return None
+
+        # choose initial anchor
+        if prefer_middle:
+            a_global = int(idx_bin[idx_bin.size // 2])
+        else:
+            a_global = int(self.rng.choice(idx_bin))
+
+        # resample if too few points after radius filter
+        trials = 1 if self.split_mode != "train" else self.resample_trials
+        for _ in range(trials):
+            idx_sel = self._knn_in_bin(
+                coord=coord,
+                idx_bin=idx_bin,
+                anchor_global=a_global,
+                k=self.point_max,
+                tree_bin=tree_bin,
+            )
+            idx_sel = np.unique(idx_sel).astype(np.int64)
+            idx_sel = self._radius_filter(coord, a_global, idx_sel)  # [CHANGED]
+
+            if idx_sel.size >= self.min_points:  # [CHANGED]
+                return idx_sel
+
+            # [CHANGED] resample anchor in train
+            if self.split_mode == "train":
+                a_global = int(self.rng.choice(idx_bin))
+            else:
+                break
+
+        # if still too few, return what we have (or None). Here: skip if empty, otherwise keep small.  # [CHANGED]
+        return idx_sel if (idx_sel is not None and idx_sel.size > 0) else None
+
+    def _ensure_min_fragments_scanbin(
+        self,
+        data_dict,
+        coord,
+        phi,
+        edges,
+        bin_indices,
+        bin_trees,
+        fragments,
+        covered,
+        target_M,
+    ):
+        """In train: add extra fragments until reaching target_M (bounded)."""  # [CHANGED]
+        extra_added = 0
+        max_extra = self.max_train_extra_fragments
+
+        while len(fragments) < target_M and extra_added < max_extra:
+            # sample an uncovered point as a hint, else random point
+            uncovered = np.where(~covered)[0]
+            if uncovered.size > 0:
+                cidx = int(self.rng.choice(uncovered, size=1)[0])
+            else:
+                cidx = int(self.rng.randint(0, coord.shape[0]))
+
+            p = float(phi[cidx])
+            b = int(np.searchsorted(edges, p, side="right") - 1)
+            b = max(0, min(b, len(bin_indices) - 1))
+            idx_bin = bin_indices[b]
+            if idx_bin.size == 0:
+                covered[cidx] = True
+                continue
+
+            # try selecting in that bin with anchor=cidx first (resample inside _select_fragment_in_bin uses random)
+            idx_sel = self._knn_in_bin(
+                coord=coord,
+                idx_bin=idx_bin,
+                anchor_global=cidx,
+                k=self.point_max,
+                tree_bin=bin_trees[b],
+            )
+            idx_sel = np.unique(idx_sel).astype(np.int64)
+            idx_sel = self._radius_filter(coord, cidx, idx_sel)  # [CHANGED]
+
+            if idx_sel.size < self.min_points:
+                # fallback to standard bin selection with resampling
+                idx_sel = self._select_fragment_in_bin(
+                    coord=coord, idx_bin=idx_bin, tree_bin=bin_trees[b], prefer_middle=False
+                )
+                if idx_sel is None:
+                    covered[cidx] = True
+                    continue
+
+            part = index_operator(data_dict, idx_sel, duplicate=True)
+            part["index"] = idx_sel
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+            fragments.append(part)
+            covered[idx_sel] = True
+            extra_added += 1
+
+        return fragments, covered
 
     def _knn_in_bin(
         self,
@@ -1592,7 +1766,6 @@ class SceneFragmentation(object):
             local_idx = np.array(local_idx, dtype=np.int64)
             return idx_bin[local_idx]
 
-        # brute force within bin
         pts = coord[idx_bin]
         dist2 = np.sum((pts - anchor) ** 2, axis=1)
         local = np.argpartition(dist2, kth=k - 1)[:k].astype(np.int64)
@@ -1616,7 +1789,6 @@ class SceneFragmentation(object):
             if uncovered.size == 0:
                 break
 
-            # pick an uncovered point -> find its bin
             cidx = int(self.rng.choice(uncovered, size=1)[0])
             p = float(phi[cidx])
 
@@ -1635,6 +1807,8 @@ class SceneFragmentation(object):
                 k=self.point_max,
                 tree_bin=bin_trees[b],
             )
+            idx_sel = np.unique(idx_sel).astype(np.int64)
+            idx_sel = self._radius_filter(coord, cidx, idx_sel)  # [CHANGED]
 
             part = index_operator(data_dict, idx_sel, duplicate=True)
             part["index"] = idx_sel
@@ -1683,13 +1857,44 @@ class SceneFragmentation(object):
         self.rng.shuffle(centers)
         return centers.astype(np.int64)
 
-    def _fragments_from_centers(self, data_dict, coord, point_max, centers_idx, tree=None):
+    def _fragments_from_centers(self, data_dict, coord, point_max, centers_idx, tree=None, target_M=None):
         fragments = []
         covered = np.zeros(coord.shape[0], dtype=bool)
 
-        for cidx in centers_idx:
-            idx = self._knn_indices(coord, center_index=int(cidx), k=point_max, tree=tree)
+        desired = int(target_M) if target_M is not None else int(len(centers_idx))
+        candidate_centers = list(map(int, centers_idx.tolist()))
+        extra_budget = self.max_train_extra_fragments if self.split_mode == "train" else 0  # [CHANGED]
+        attempts = 0
+
+        while len(fragments) < desired and attempts < (len(candidate_centers) + extra_budget):
+            if attempts < len(candidate_centers):
+                cidx = candidate_centers[attempts]
+            else:
+                cidx = int(self.rng.randint(0, coord.shape[0]))
+            attempts += 1
+
+            idx = self._knn_indices(coord, center_index=cidx, k=point_max, tree=tree)
             idx = np.unique(idx).astype(np.int64)
+            idx = self._radius_filter(coord, cidx, idx)  # [CHANGED]
+
+            if idx.size < self.min_points and self.split_mode == "train":
+                ok = False
+                for _ in range(self.resample_trials - 1):
+                    cidx2 = int(self.rng.randint(0, coord.shape[0]))
+                    idx2 = self._knn_indices(coord, center_index=cidx2, k=point_max, tree=tree)
+                    idx2 = np.unique(idx2).astype(np.int64)
+                    idx2 = self._radius_filter(coord, cidx2, idx2)
+                    if idx2.size >= self.min_points:
+                        cidx, idx = cidx2, idx2
+                        ok = True
+                        break
+                # if still not ok, keep small fragment if non-empty; else skip
+                if (not ok) and idx.size == 0:
+                    continue
+
+            if idx.size == 0:
+                continue
+
             part = index_operator(data_dict, idx, duplicate=True)
             part["index"] = idx
             if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
@@ -1720,6 +1925,11 @@ class SceneFragmentation(object):
             cidx = int(self.rng.choice(uncovered, size=1)[0])
             idx = self._knn_indices(coord, center_index=cidx, k=point_max, tree=tree)
             idx = np.unique(idx).astype(np.int64)
+            idx = self._radius_filter(coord, cidx, idx)  # [CHANGED]
+
+            if idx.size == 0:
+                covered[cidx] = True
+                continue
 
             part = index_operator(data_dict, idx, duplicate=True)
             part["index"] = idx
@@ -1730,3 +1940,633 @@ class SceneFragmentation(object):
             covered[idx] = True
             extra_added += 1
         return fragments
+
+
+@TRANSFORMS.register_module()
+class SceneFragmentation(object):
+    def __init__(
+        self,
+        mode="base",               # "base" | "ScanBinCrop"
+        split_mode="train",        # "train" | "test"
+        point_max=30000,
+        anchor_grid_size=0.5,      # used only in base mode anchor selection
+        seed=None,
+        azimuth_range=(0.0, 2.0 * np.pi),  # bins over [0, 2pi) by default
+
+        max_radius=3,           
+        min_points=2048,          
+        resample_trials=5,            #  how many times to resample anchor if too few points
+        max_train_extra_fragments=32, # allow extra fragments in train when radius cap reduces coverage
+
+        train_base_ratio=0.3,
+        rare_class_ids=(3, 5, 6),      
+        rare_min_pos_frags=6,          
+        rare_extra_fragments=24,       
+        rare_anchor_trials=200, 
+    ):
+        assert mode.lower() in ["base", "scanbincrop", "spherecrop"]
+        assert split_mode in ["train", "test"]
+
+        self.mode = mode.lower()
+        self.mode = "base" if mode.lower() == "spherecrop" else mode.lower()
+        self.split_mode = split_mode
+        self.point_max = int(point_max)
+        self.anchor_grid_size = float(anchor_grid_size)
+        self.max_extra_fragments = 32
+
+        self.az_min = float(azimuth_range[0])
+        self.az_max = float(azimuth_range[1])
+
+        self.rng = np.random.RandomState(seed) if seed is not None else np.random
+
+        try:
+            from scipy.spatial import cKDTree
+            self._cKDTree = cKDTree
+        except Exception:
+            self._cKDTree = None
+
+        self.max_radius = None if max_radius is None else float(max_radius)
+        self.min_points = int(min_points)
+        self.resample_trials = int(resample_trials)
+        self.max_train_extra_fragments = int(max_train_extra_fragments)
+
+        self.train_base_ratio = float(train_base_ratio)
+        self.rare_class_ids = tuple(int(x) for x in rare_class_ids) if rare_class_ids is not None else tuple()
+        self.rare_min_pos_frags = int(rare_min_pos_frags)
+        self.rare_extra_fragments = int(rare_extra_fragments)
+        self.rare_anchor_trials = int(rare_anchor_trials)
+
+
+    def __call__(self, data_dict):
+        assert "coord" in data_dict
+        coord = data_dict["coord"]
+        N = int(coord.shape[0])
+
+        if N == 0:
+            return []
+
+        if N <= self.point_max:
+            idx = np.arange(N, dtype=np.int64)
+            part = index_operator(data_dict, idx, duplicate=True)
+            part["index"] = idx
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+            return [part]
+
+        M = int(np.ceil(N / float(self.point_max)))
+        M = max(1, M)
+
+        if self.mode == "base":
+            fragments = self._base_fragmentation(data_dict, coord, M)
+        elif self.mode == "scanbincrop":
+            fragments = self._scan_bin_crop(data_dict, coord, M)
+        else:
+            raise NotImplementedError(f"Unknown fragmentation mode: {self.mode}")
+
+        # self._debug_print_rare_distribution(data_dict, fragments)
+        return fragments
+
+    def _base_fragmentation(self, data_dict, coord: np.ndarray, M: int):
+        tree = self._cKDTree(coord) if self._cKDTree is not None else None
+
+        if self.split_mode == "train":
+            M_base = max(1, int(np.ceil(M * self.train_base_ratio)))
+        else:
+            M_base = M
+
+        centers_idx = self._voxel_anchors(coord, M_base)
+        fragments, covered = self._fragments_from_centers(
+            data_dict,
+            coord,
+            self.point_max,
+            centers_idx,
+            tree=tree,
+            target_M=M_base)
+
+        # [RARE]  
+        if self.split_mode == "train":
+            fragments, covered = self._boost_rare_fragments(
+                data_dict, coord, tree, fragments, covered
+            )
+
+        if self.split_mode == "test":
+            fragments = self._ensure_coverage(
+                data_dict=data_dict,
+                coord=coord,
+                point_max=self.point_max,
+                tree=tree,
+                fragments=fragments,
+                covered=covered,
+            )
+        return fragments
+
+    def _scan_bin_crop(self, data_dict, coord: np.ndarray, M: int):
+        phi = np.arctan2(coord[:, 1], coord[:, 0]).astype(np.float64)
+        phi = (phi + 2.0 * np.pi) % (2.0 * np.pi)
+
+        edges = np.linspace(self.az_min, self.az_max, M + 1, endpoint=True)
+
+        fragments = []
+        covered = np.zeros(coord.shape[0], dtype=bool)
+
+        bin_indices = []
+        for b in range(M):
+            lo, hi = edges[b], edges[b + 1]
+            if b < M - 1:
+                mask = (phi >= lo) & (phi < hi)
+            else:
+                mask = (phi >= lo) & (phi <= hi)
+            idx_bin = np.where(mask)[0].astype(np.int64)
+            bin_indices.append(idx_bin)
+
+        bin_trees = [None] * M
+        if self._cKDTree is not None:
+            for b in range(M):
+                idx_bin = bin_indices[b]
+                if idx_bin.size > 0:
+                    bin_trees[b] = self._cKDTree(coord[idx_bin])
+
+        # [CHANGED] per-bin anchor resampling + radius + min_points
+        for b in range(M):
+            idx_bin = bin_indices[b]
+            if idx_bin.size == 0:
+                continue
+
+            idx_sel = self._select_fragment_in_bin(
+                coord=coord,
+                idx_bin=idx_bin,
+                tree_bin=bin_trees[b],
+                prefer_middle=(self.split_mode != "train"),
+            )
+
+            if idx_sel is None or idx_sel.size == 0:
+                continue
+
+            part = index_operator(data_dict, idx_sel, duplicate=True)
+            part["index"] = idx_sel
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+            fragments.append(part)
+            covered[idx_sel] = True
+
+        if self.split_mode == "train":
+            fragments, covered = self._ensure_min_fragments_scanbin(
+                data_dict=data_dict,
+                coord=coord,
+                phi=phi,
+                edges=edges,
+                bin_indices=bin_indices,
+                bin_trees=bin_trees,
+                fragments=fragments,
+                covered=covered,
+                target_M=M,
+            )
+            tree_all = self._cKDTree(coord) if self._cKDTree is not None else None
+            fragments, covered = self._boost_rare_fragments(
+                data_dict, coord, tree_all, fragments, covered
+            )
+
+        if self.split_mode == "test":
+            fragments, covered = self._ensure_coverage_scanbin(
+                data_dict=data_dict,
+                coord=coord,
+                phi=phi,
+                edges=edges,
+                bin_indices=bin_indices,
+                bin_trees=bin_trees,
+                fragments=fragments,
+                covered=covered,
+            )
+
+        return fragments
+
+    # def _radius_filter(self, coord: np.ndarray, anchor_global: int, idx: np.ndarray) -> np.ndarray:
+    #     """Filter indices by max_radius around anchor. If max_radius is None -> no-op."""  # [CHANGED]
+    #     if self.max_radius is None or idx.size == 0:
+    #         return idx
+    #     a = coord[anchor_global]
+    #     pts = coord[idx]
+    #     dist2 = np.sum((pts - a) ** 2, axis=1)
+    #     keep = dist2 <= (self.max_radius ** 2)
+    #     return idx[keep]
+    
+    def _radius_filter(self, coord: np.ndarray, anchor_global: int, idx: np.ndarray) -> np.ndarray:
+        """Cylinder Filter indices by max_radius around anchor."""
+        if self.max_radius is None or idx.size == 0:
+            return idx
+        a = coord[anchor_global]
+        pts = coord[idx]
+
+        # cylinder in XY plane
+        dxy2 = (pts[:, 0] - a[0]) ** 2 + (pts[:, 1] - a[1]) ** 2
+        keep = dxy2 <= (self.max_radius ** 2)
+        return idx[keep]
+
+
+    def _select_fragment_in_bin(self, coord, idx_bin, tree_bin, prefer_middle=False):
+        """Pick an anchor in bin (with resampling) and return selected indices (radius+min_points applied)."""  # [CHANGED]
+        if idx_bin.size == 0:
+            return None
+
+        # choose initial anchor
+        if prefer_middle:
+            a_global = int(idx_bin[idx_bin.size // 2])
+        else:
+            a_global = int(self.rng.choice(idx_bin))
+
+        # resample if too few points after radius filter
+        trials = 1 if self.split_mode != "train" else self.resample_trials
+        for _ in range(trials):
+            idx_sel = self._knn_in_bin(
+                coord=coord,
+                idx_bin=idx_bin,
+                anchor_global=a_global,
+                k=self.point_max,
+                tree_bin=tree_bin,
+            )
+            idx_sel = np.unique(idx_sel).astype(np.int64)
+            idx_sel = self._radius_filter(coord, a_global, idx_sel)  # [CHANGED]
+
+            if idx_sel.size >= self.min_points:  # [CHANGED]
+                return idx_sel
+
+            if self.split_mode == "train":
+                a_global = int(self.rng.choice(idx_bin))
+            else:
+                break
+
+        # if still too few, return what we have (or None). Here: skip if empty, otherwise keep small.  # [CHANGED]
+        return idx_sel if (idx_sel is not None and idx_sel.size > 0) else None
+
+    def _ensure_min_fragments_scanbin(
+        self,
+        data_dict,
+        coord,
+        phi,
+        edges,
+        bin_indices,
+        bin_trees,
+        fragments,
+        covered,
+        target_M,
+    ):
+        extra_added = 0
+        max_extra = self.max_train_extra_fragments
+
+        while len(fragments) < target_M and extra_added < max_extra:
+            # sample an uncovered point as a hint, else random point
+            uncovered = np.where(~covered)[0]
+            if uncovered.size > 0:
+                cidx = int(self.rng.choice(uncovered, size=1)[0])
+            else:
+                cidx = int(self.rng.randint(0, coord.shape[0]))
+
+            p = float(phi[cidx])
+            b = int(np.searchsorted(edges, p, side="right") - 1)
+            b = max(0, min(b, len(bin_indices) - 1))
+            idx_bin = bin_indices[b]
+            if idx_bin.size == 0:
+                covered[cidx] = True
+                continue
+
+            # try selecting in that bin with anchor=cidx first (resample inside _select_fragment_in_bin uses random)
+            idx_sel = self._knn_in_bin(
+                coord=coord,
+                idx_bin=idx_bin,
+                anchor_global=cidx,
+                k=self.point_max,
+                tree_bin=bin_trees[b],
+            )
+            idx_sel = np.unique(idx_sel).astype(np.int64)
+            idx_sel = self._radius_filter(coord, cidx, idx_sel)  # [CHANGED]
+
+            if idx_sel.size < self.min_points:
+                # fallback to standard bin selection with resampling
+                idx_sel = self._select_fragment_in_bin(
+                    coord=coord, idx_bin=idx_bin, tree_bin=bin_trees[b], prefer_middle=False
+                )
+                if idx_sel is None:
+                    covered[cidx] = True
+                    continue
+
+            part = index_operator(data_dict, idx_sel, duplicate=True)
+            part["index"] = idx_sel
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+            fragments.append(part)
+            covered[idx_sel] = True
+            extra_added += 1
+
+        return fragments, covered
+
+    def _knn_in_bin(
+        self,
+        coord: np.ndarray,
+        idx_bin: np.ndarray,
+        anchor_global: int,
+        k: int,
+        tree_bin=None,
+    ) -> np.ndarray:
+
+        if idx_bin.size <= k:
+            return idx_bin.copy()
+
+        anchor = coord[anchor_global]
+
+        if tree_bin is not None:
+            local_anchor = int(np.where(idx_bin == anchor_global)[0][0])
+            _, local_idx = tree_bin.query(coord[idx_bin][local_anchor], k=min(k, idx_bin.size))
+            local_idx = np.array(local_idx, dtype=np.int64)
+            return idx_bin[local_idx]
+
+        pts = coord[idx_bin]
+        dist2 = np.sum((pts - anchor) ** 2, axis=1)
+        local = np.argpartition(dist2, kth=k - 1)[:k].astype(np.int64)
+        return idx_bin[local]
+
+    def _ensure_coverage_scanbin(
+        self,
+        data_dict,
+        coord: np.ndarray,
+        phi: np.ndarray,
+        edges: np.ndarray,
+        bin_indices: list,
+        bin_trees: list,
+        fragments: list,
+        covered: np.ndarray,
+    ):
+        extra_added = 0
+
+        while extra_added < self.max_extra_fragments:
+            uncovered = np.where(~covered)[0]
+            if uncovered.size == 0:
+                break
+
+            cidx = int(self.rng.choice(uncovered, size=1)[0])
+            p = float(phi[cidx])
+
+            b = int(np.searchsorted(edges, p, side="right") - 1)
+            b = max(0, min(b, len(bin_indices) - 1))
+
+            idx_bin = bin_indices[b]
+            if idx_bin.size == 0:
+                covered[cidx] = True
+                continue
+
+            idx_sel = self._knn_in_bin(
+                coord=coord,
+                idx_bin=idx_bin,
+                anchor_global=cidx,
+                k=self.point_max,
+                tree_bin=bin_trees[b],
+            )
+            idx_sel = np.unique(idx_sel).astype(np.int64)
+            idx_sel = self._radius_filter(coord, cidx, idx_sel)  # [CHANGED]
+
+            # [CHANGED] if too few points in test, we still keep it (coverage 목적) — but you can enforce min_points if you want.
+            part = index_operator(data_dict, idx_sel, duplicate=True)
+            part["index"] = idx_sel
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+
+            fragments.append(part)
+            covered[idx_sel] = True
+            extra_added += 1
+
+        return fragments, covered
+
+    def _voxel_anchors(self, coord: np.ndarray, M: int):
+        gs = self.anchor_grid_size
+        if gs <= 0:
+            idx = self.rng.choice(
+                coord.shape[0],
+                size=M,
+                replace=False if M <= coord.shape[0] else True,
+            )
+            return idx.astype(np.int64)
+
+        grid = np.floor(coord / gs).astype(np.int64)
+        grid -= grid.min(0)
+
+        key = GridSample.fnv_hash_vec(grid)
+        idx_sort = np.argsort(key)
+        key_sort = key[idx_sort]
+
+        _, start_idx = np.unique(key_sort, return_index=True)
+        anchors = idx_sort[start_idx]
+
+        if anchors.size >= M:
+            sel = self.rng.choice(anchors.size, size=M, replace=False)
+            centers = anchors[sel]
+        else:
+            need = M - anchors.size
+            extra = self.rng.choice(
+                coord.shape[0],
+                size=need,
+                replace=False if need <= coord.shape[0] else True,
+            )
+            centers = np.concatenate([anchors, extra.astype(np.int64)], axis=0)
+            centers = np.unique(centers)
+
+        self.rng.shuffle(centers)
+        return centers.astype(np.int64)
+
+    def _fragments_from_centers(self, data_dict, coord, point_max, centers_idx, tree=None, target_M=None):
+        fragments = []
+        covered = np.zeros(coord.shape[0], dtype=bool)
+
+        desired = int(target_M) if target_M is not None else int(len(centers_idx))
+        candidate_centers = list(map(int, centers_idx.tolist()))
+        extra_budget = self.max_train_extra_fragments if self.split_mode == "train" else 0  # [CHANGED]
+        attempts = 0
+
+        while len(fragments) < desired and attempts < (len(candidate_centers) + extra_budget):
+            if attempts < len(candidate_centers):
+                cidx = candidate_centers[attempts]
+            else:
+                cidx = int(self.rng.randint(0, coord.shape[0]))
+            attempts += 1
+
+            idx = self._knn_indices(coord, center_index=cidx, k=point_max, tree=tree)
+            idx = np.unique(idx).astype(np.int64)
+            idx = self._radius_filter(coord, cidx, idx)  # [CHANGED]
+
+            # [CHANGED] resample anchor if too few points (train only)
+            if idx.size < self.min_points and self.split_mode == "train":
+                ok = False
+                for _ in range(self.resample_trials - 1):
+                    cidx2 = int(self.rng.randint(0, coord.shape[0]))
+                    idx2 = self._knn_indices(coord, center_index=cidx2, k=point_max, tree=tree)
+                    idx2 = np.unique(idx2).astype(np.int64)
+                    idx2 = self._radius_filter(coord, cidx2, idx2)
+                    if idx2.size >= self.min_points:
+                        cidx, idx = cidx2, idx2
+                        ok = True
+                        break
+                # if still not ok, keep small fragment if non-empty; else skip
+                if (not ok) and idx.size == 0:
+                    continue
+
+            if idx.size == 0:
+                continue
+
+            part = index_operator(data_dict, idx, duplicate=True)
+            part["index"] = idx
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+            fragments.append(part)
+            covered[idx] = True
+
+        return fragments, covered
+
+    def _knn_indices(self, coord: np.ndarray, center_index: int, k: int, tree=None) -> np.ndarray:
+        center = coord[center_index]
+        if tree is not None:
+            _, idx = tree.query(center, k=min(k, coord.shape[0]))
+            return np.array(idx, dtype=np.int64)
+
+        dist2 = np.sum((coord - center) ** 2, axis=1)
+        if k >= coord.shape[0]:
+            return np.arange(coord.shape[0], dtype=np.int64)
+        return np.argpartition(dist2, kth=k - 1)[:k].astype(np.int64)
+
+    def _ensure_coverage(self, data_dict, coord, point_max, tree, fragments, covered):
+        extra_added = 0
+        while extra_added < self.max_extra_fragments:
+            uncovered = np.where(~covered)[0]
+            if uncovered.size == 0:
+                break
+
+            cidx = int(self.rng.choice(uncovered, size=1)[0])
+            idx = self._knn_indices(coord, center_index=cidx, k=point_max, tree=tree)
+            idx = np.unique(idx).astype(np.int64)
+            idx = self._radius_filter(coord, cidx, idx)  # [CHANGED]
+
+            if idx.size == 0:
+                covered[cidx] = True
+                continue
+
+            part = index_operator(data_dict, idx, duplicate=True)
+            part["index"] = idx
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+
+            fragments.append(part)
+            covered[idx] = True
+            extra_added += 1
+        return fragments
+    
+    def _has_rare(self, labels: np.ndarray) -> np.ndarray:
+        if labels is None or len(self.rare_class_ids) == 0:
+            return np.empty((0,), dtype=np.int64)
+        mask = np.zeros(labels.shape[0], dtype=bool)
+        for cid in self.rare_class_ids:
+            mask |= (labels == cid)
+        return np.where(mask)[0].astype(np.int64)
+
+    def _frag_is_rare_positive(self, labels: np.ndarray, idx: np.ndarray) -> bool:
+        if labels is None or idx is None or idx.size == 0:
+            return False
+        y = labels[idx]
+        y = y[y != -1]
+        if y.size == 0:
+            return False
+        for cid in self.rare_class_ids:
+            if np.any(y == cid):
+                return True
+        return False
+
+    def _boost_rare_fragments(self, data_dict, coord, tree, fragments, covered):
+        if self.split_mode != "train":
+            return fragments, covered
+
+        labels = data_dict.get("segment", None)
+        assert labels is not None, (
+            "SceneFragmentation: 'segment' key not found in data_dict. "
+        )
+
+        rare_idx_all = self._has_rare(labels)
+        if rare_idx_all.size == 0:
+            return fragments, covered
+
+        pos = 0
+        for fr in fragments:
+            idx = fr.get("index", None)
+            if idx is not None and self._frag_is_rare_positive(labels, idx):
+                pos += 1
+
+        if pos >= self.rare_min_pos_frags:
+            return fragments, covered
+
+        need = self.rare_min_pos_frags - pos
+        add_budget = min(self.rare_extra_fragments, need)
+
+        added = 0
+        trials = 0
+
+        seen = set()
+        for fr in fragments:
+            idx = fr.get("index", None)
+            if idx is not None and idx.size > 0:
+                seen.add((int(idx[0]), int(idx[-1]), int(idx.size)))
+
+        while added < add_budget and trials < self.rare_anchor_trials:
+            trials += 1
+            a = int(self.rng.choice(rare_idx_all))
+
+            idx = self._knn_indices(coord, center_index=a, k=self.point_max, tree=tree)
+            idx = np.unique(idx).astype(np.int64)
+            idx = self._radius_filter(coord, a, idx)
+
+            if idx.size < self.min_points:
+                continue
+            if not self._frag_is_rare_positive(labels, idx):
+                continue
+
+            sig = (int(idx[0]), int(idx[-1]), int(idx.size))
+            if sig in seen:
+                continue
+            seen.add(sig)
+
+            part = index_operator(data_dict, idx, duplicate=True)
+            part["index"] = idx
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+
+            fragments.append(part)
+            covered[idx] = True
+            added += 1
+
+        return fragments, covered
+    
+    def _debug_print_rare_distribution(self, data_dict, fragments):
+        labels = data_dict.get("segment", None)
+        assert labels is not None, "'segment' key missing for debug print"
+
+        total_frags = len(fragments)
+        rare_frag_count = {cid: 0 for cid in self.rare_class_ids}
+        rare_point_total = {cid: 0 for cid in self.rare_class_ids}
+
+        for fr in fragments:
+            idx = fr.get("index", None)
+            if idx is None or idx.size == 0:
+                continue
+
+            y = labels[idx]
+            y = y[y != -1]
+
+            for cid in self.rare_class_ids:
+                cnt = int((y == cid).sum())
+                if cnt > 0:
+                    rare_frag_count[cid] += 1
+                    rare_point_total[cid] += cnt
+
+        print("\n[SceneFragmentation DEBUG]")
+        print(f"Total fragments: {total_frags}")
+        for cid in self.rare_class_ids:
+            print(
+                f"Class {cid} -> "
+                f"Fragments containing: {rare_frag_count[cid]}, "
+                f"Total points in fragments: {rare_point_total[cid]}"
+            )
+
