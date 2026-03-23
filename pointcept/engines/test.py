@@ -176,6 +176,7 @@ class SemSegTester(TesterBase):
             segment = data_dict.pop("segment")
             data_name = data_dict.pop("name")
             pred_save_path = os.path.join(save_path, "{}_pred.npy".format(data_name))
+            score_save_path = os.path.join(save_path, "{}_score.npy".format(data_name))
             if os.path.isfile(pred_save_path):
                 logger.info(
                     "{}/{}: {}, loaded pred and label.".format(
@@ -216,14 +217,18 @@ class SemSegTester(TesterBase):
                             batch_num=len(fragment_list),
                         )
                     )
+                
+                score = pred.detach().cpu().numpy()
+                if "origin_segment" in data_dict.keys():
+                    assert "inverse" in data_dict.keys()
+                    score = score[data_dict["inverse"]]
+                    segment = data_dict["origin_segment"]
+                np.save(score_save_path, score)
+                
                 if self.cfg.data.test.type == "ScanNetPPDataset":
                     pred = pred.topk(3, dim=1)[1].data.cpu().numpy()
                 else:
                     pred = pred.max(1)[1].data.cpu().numpy()
-                if "origin_segment" in data_dict.keys():
-                    assert "inverse" in data_dict.keys()
-                    pred = pred[data_dict["inverse"]]
-                    segment = data_dict["origin_segment"]
                 np.save(pred_save_path, pred)
             if (
                 self.cfg.data.test.type == "ScanNetDataset"

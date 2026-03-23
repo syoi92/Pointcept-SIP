@@ -676,8 +676,6 @@ class SIPSemSegEvaluator(HookBase):
                     if len(fragment_list) == 0:
                         continue
 
-                    # Decide whether we can stitch back to scene-level labels
-                    # If any fragment has 'index', we assume all do.
                     has_index = ("index" in fragment_list[0])
 
                     if has_index:
@@ -686,15 +684,14 @@ class SIPSemSegEvaluator(HookBase):
                         max_idx = -1
                         for f in fragment_list:
                             idx_f = f["index"]
-                            # idx_f might be numpy or torch; normalize
                             if isinstance(idx_f, torch.Tensor):
                                 max_idx = max(max_idx, int(idx_f.max().item()))
                             else:
                                 max_idx = max(max_idx, int(np.max(idx_f)))
                         scene_N = max_idx + 1
 
-                        # pred_score accumulator for voting/averaging
                         pred_score = torch.zeros((scene_N, num_classes), device="cuda", dtype=torch.float32)
+                        vote_count = torch.zeros((scene_N,), device="cuda", dtype=torch.long)
 
                         # scene segment (if present) for exact metric
                         # Prefer dataset-provided segment if available in batch; otherwise try fragments.
@@ -733,21 +730,19 @@ class SIPSemSegEvaluator(HookBase):
                             loss_cnt += 1
 
                         if has_index:
-                            # accumulate softmax scores back to scene indices
                             prob = torch.softmax(logits, dim=-1)
 
                             idx_part = input_dict["index"]
-                            # idx_part should be 1D tensor aligned with concatenated points in this frag batch
                             if not isinstance(idx_part, torch.Tensor):
                                 idx_part = torch.as_tensor(idx_part, device="cuda")
 
-                            # use offset to split fragments inside this batch
                             bs0 = 0
                             for be in input_dict["offset"]:
+                                idx_cur = idx_part[bs0:be].long()
                                 pred_score[idx_part[bs0:be], :] += prob[bs0:be]
+                                vote_count[idx_cur] += 1
                                 bs0 = be
                         else:
-                            # compute metric per fragment batch directly
                             pred = logits.argmax(dim=1)
                             seg = input_dict["segment"]
                             intersection, union, target = intersection_and_union_gpu(
@@ -758,14 +753,22 @@ class SIPSemSegEvaluator(HookBase):
                             target_total += target.to(torch.float64)
 
                     if has_index:
-                        # finalize scene prediction and compute metrics
                         pred_scene = pred_score.argmax(dim=1)
 
                         if not isinstance(scene_segment, torch.Tensor):
                             scene_segment = torch.as_tensor(scene_segment, device="cuda")
+                        
+                        scene_segment = scene_segment.long()
+                        covered_mask = vote_count > 0
+
+                        pred_scene_masked = pred_scene.clone()                        
+                        pred_scene_masked[~covered_mask] = ignore_index
+
+                        scene_segment_masked = scene_segment.clone()
+                        scene_segment_masked[~covered_mask] = ignore_index
 
                         intersection, union, target = intersection_and_union_gpu(
-                            pred_scene, scene_segment, num_classes, ignore_index
+                            pred_scene_masked, scene_segment_masked, num_classes, ignore_index
                         )
                         inter_total += intersection.to(torch.float64)
                         union_total += union.to(torch.float64)

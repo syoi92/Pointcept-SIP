@@ -30,6 +30,16 @@ num_worker = 12
 empty_cache = True
 enable_amp = True
 
+# dataset settings
+dataset_type = "SIPDataset"
+data_root = "data/sip-base-r01-cluttered"
+
+sampling_mode = "manifold"
+sample_res = 0.12
+frag_mode = "scanbin" 
+point_max = 30000
+rare_boost = (5, 6)
+
 # model settings
 model = dict(
     type="DefaultSegmentor",
@@ -40,48 +50,37 @@ model = dict(
         patch_embed_depth=2,
         patch_embed_channels=48,
         patch_embed_groups=6,
-        patch_embed_neighbours=8, #16,
-        enc_depths=(2, 2, 4, 2), #(2, 6, 2),
-        enc_channels=(96, 192, 384, 384), # (96, 192, 384),
-        enc_groups=(12, 24, 48, 48), #(12, 24, 48),
-        enc_neighbours=(16, 16, 16, 16), #(16, 16, 16),
-        dec_depths=(1, 1, 1, 1), #(1, 1, 1),
-        dec_channels=(48, 96, 192, 384), #(48, 96, 192),
-        dec_groups=(6, 12, 24, 48), #(6, 12, 24),
-        dec_neighbours=(16, 16, 16, 16), #(16, 16, 16),
-        grid_sizes=(0.03, 0.075, 0.225, 0.675), #(0.1, 0.2, 0.4),
+        patch_embed_neighbours=8, 
+        enc_depths=(2,6,2),#(2, 4, 2), 
+        enc_channels=(96, 192, 384), 
+        enc_groups=(12, 24, 48), 
+        enc_neighbours=(16, 16, 12), 
+        dec_depths=(1, 1, 1),
+        dec_channels=(48, 96, 192),
+        dec_groups=(6, 12, 24),
+        dec_neighbours=(16, 16, 12),
+        grid_sizes=(0.15, 0.30, 0.48),
         attn_qkv_bias=True,
         pe_multiplier=True,
         pe_bias=True,
         attn_drop_rate=0.0,
-        drop_path_rate=0.3,
+        drop_path_rate=0.1,
         enable_checkpoint=False,
         unpool_backend="interp",  # map / interp
     ),
-    criteria=[dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1)],
+    criteria=[
+        dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
+        # dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
+        dict(type="FocalLoss", loss_weight=0.5, ignore_index=-1, gamma=1.0),
+    ],
 )
 
 # scheduler settings
-epoch = 100
-optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
+epoch = 80
+optimizer = dict(type="AdamW", lr=0.001, weight_decay=0.01)
 scheduler = dict(type="MultiStepLR", milestones=[0.6, 0.8], gamma=0.1)
 eval_epoch = 10
 
-
-# dataset settings
-dataset_type = "SIPDataset"
-data_root = "data/sip-base-r01"
-grid_size = 0.15
-frag_mode = "base"
-point_max = 30000
-
-sampling_mode = "grid"
-w_curv = 1.0
-w_lin = 0.3
-w_planar = 0.4
-use_density_dilution=True
-gamma=4.0
-dmin=0.1
 
 
 data = dict(
@@ -103,15 +102,9 @@ data = dict(
         transform=[
             dict(
                 type="SceneSampling",
-                grid_size=grid_size,
-                grid_equiv_size=grid_size,
                 mode=sampling_mode,
-                w_curv=w_curv,
-                w_planar=w_planar,
-                w_lin=w_lin,
-                use_density_dilution=use_density_dilution,
-                gamma=gamma,
-                dmin=dmin
+                sample_res=sample_res,
+                return_grid_coord=True,
             ),  
             dict(type="RandomDropout", dropout_ratio=0.2, dropout_application_ratio=0.2),
             # dict(type="RandomRotateTargetAngle", angle=(1/2, 1, 3/2), center=[0, 0, 0], axis="z", p=0.75),
@@ -131,19 +124,18 @@ data = dict(
         ],
         fragmentation=       
             dict(
-                type="SceneFragmentation2",
+                type="SceneFragmentation",
                 mode=frag_mode,
                 split_mode="train",
                 point_max=point_max,
-                max_radius=5,
+                rare_class_ids=rare_boost, 
             ),    
         post_transform=[
-            dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=("coord","segment"),
+                keys=("coord", "grid_coord","segment"),
                 feat_keys=["coord", "color"],
                 # feat_keys=["coord", "color", "intensity", "normal"],
             ),
@@ -152,37 +144,29 @@ data = dict(
     ),
     val=dict(
         type=dataset_type,
-        split="val",
+        split="test",
         data_root=data_root,
         transform=[
             dict(
                 type="SceneSampling",
-                grid_size=grid_size,
-                grid_equiv_size=grid_size,
                 mode=sampling_mode,
-                w_curv=w_curv,
-                w_planar=w_planar,
-                w_lin=w_lin,
-                use_density_dilution=use_density_dilution,
-                gamma=gamma,
-                dmin=dmin
-            ),           
+                sample_res=sample_res,
+                return_grid_coord=True,
+            ),          
         ],
         fragmentation=       
             dict(
-                type="SceneFragmentation2",
+                type="SceneFragmentation",
                 mode=frag_mode,
                 split_mode="test",
                 point_max=point_max,
-                max_radius=5,
             ),    
         post_transform=[
-            dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=("coord","segment"),
+                keys=("coord", "grid_coord", "segment"),
                 feat_keys=["coord", "color"],
                 # feat_keys=["coord", "color", "intensity", "normal"],
             ),
@@ -197,51 +181,43 @@ data = dict(
         transform=[
             dict(
                 type="SceneSampling",
-                grid_size=grid_size,
-                grid_equiv_size=grid_size,
                 mode=sampling_mode,
-                w_curv=w_curv,
-                w_planar=w_planar,
-                w_lin=w_lin,
-                use_density_dilution=use_density_dilution,
-                gamma=gamma,
-                dmin=dmin
+                sample_res=sample_res,
+                return_grid_coord=True,
             ),          
         ], 
         fragmentation=       
             dict(
-                type="SceneFragmentation2",
+                type="SceneFragmentation",
                 mode=frag_mode,
                 split_mode="test",
                 point_max=point_max,
-                max_radius=5,
             ),    
         post_transform=[     
-            dict(type="CenterShift", apply_z=False),   
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=("coord", "index"),
+                keys=("coord", "grid_coord", "index"),
                 feat_keys=("coord", "color"),
             ),
         ],
         test_cfg=dict(
-            # aug_transform=[[dict(type="Identity")],],
-            aug_transform=[
-                [dict(type="RandomScale", scale=[0.95, 0.95])],
-                [dict(type="RandomScale", scale=[1, 1])],
-                [dict(type="RandomScale", scale=[1.05, 1.05])],
-                [
-                    dict(type="RandomScale", scale=[0.95, 0.95]),
-                    dict(type="RandomFlip", p=1),
-                ],
-                [dict(type="RandomScale", scale=[1, 1]), dict(type="RandomFlip", p=1)],
-                [
-                    dict(type="RandomScale", scale=[1.05, 1.05]),
-                    dict(type="RandomFlip", p=1),
-                ],
-            ],
+            aug_transform=[[dict(type="Identity")],],
+            # aug_transform=[
+            #     [dict(type="RandomScale", scale=[0.95, 0.95])],
+            #     [dict(type="RandomScale", scale=[1, 1])],
+            #     [dict(type="RandomScale", scale=[1.05, 1.05])],
+            #     [
+            #         dict(type="RandomScale", scale=[0.95, 0.95]),
+            #         dict(type="RandomFlip", p=1),
+            #     ],
+            #     [dict(type="RandomScale", scale=[1, 1]), dict(type="RandomFlip", p=1)],
+            #     [
+            #         dict(type="RandomScale", scale=[1.05, 1.05]),
+            #         dict(type="RandomFlip", p=1),
+            #     ],
+            # ],
         ),
     ),
 )
