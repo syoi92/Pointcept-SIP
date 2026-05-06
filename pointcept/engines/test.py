@@ -219,17 +219,19 @@ class SemSegTester(TesterBase):
                     )
                 
                 score = pred.detach().cpu().numpy()
-                if "origin_segment" in data_dict.keys():
-                    assert "inverse" in data_dict.keys()
-                    score = score[data_dict["inverse"]]
-                    segment = data_dict["origin_segment"]
-                np.save(score_save_path, score)
-                
                 if self.cfg.data.test.type == "ScanNetPPDataset":
                     pred = pred.topk(3, dim=1)[1].data.cpu().numpy()
                 else:
                     pred = pred.max(1)[1].data.cpu().numpy()
+
+                if "origin_segment" in data_dict.keys():
+                    assert "inverse" in data_dict.keys()
+                    score = score[data_dict["inverse"]]
+                    pred = pred[data_dict["inverse"]]
+                    segment = data_dict["origin_segment"]
+                np.save(score_save_path, score)
                 np.save(pred_save_path, pred)
+                
             if (
                 self.cfg.data.test.type == "ScanNetDataset"
                 or self.cfg.data.test.type == "ScanNet200Dataset"

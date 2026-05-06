@@ -14,6 +14,7 @@ import scipy.stats
 import numpy as np
 import torch
 import copy
+import math
 from collections.abc import Sequence, Mapping
 
 from pointcept.utils.registry import Registry
@@ -1207,70 +1208,322 @@ class Identity(object):
             return [data_dict]
         return data_dict
 
-
 @TRANSFORMS.register_module()
 class ManifoldSample(object):
     def __init__(
         self,
-        mani_res=0.05,
-        incidence_min=0.05,
+        grid_size,
+        beta=0.25,
+        r0_mode="percentile",
+        manifold_only=False,   # default = joint mode
+        match_count=False,
         return_inverse=False,
         return_grid_coord=False,
     ):
-        self.mani_res = mani_res
-        self.incidence_min = incidence_min
+        self.grid_size = float(grid_size)
+        self.beta = float(beta)
+        
+        self.manifold_only = bool(manifold_only)
+        self.match_count = bool(match_count)
         self.return_inverse = return_inverse
         self.return_grid_coord = return_grid_coord
+
         self.eps = 1e-12
+        self.incidence_min = 0.05
+        self.percentile_q = 60.0
+        self.center_radius = 2.0
+        self.match_tol = 0.05
+        self.match_max_iter = 20
+        self.match_low_scale = 0.75
+        self.match_high_scale = 1.50
+
+        self.r0_mode, self.r0_value = self._parse_r0_mode(r0_mode)
 
     def __call__(self, data_dict):
         assert "coord" in data_dict.keys()
         assert "normal" in data_dict.keys()
+
         coord = data_dict["coord"]
         normal = data_dict["normal"]
 
+        manifold_coord = self._compute_manifold_coord(coord, normal)
+        target_count = self._count_unique_voxels(coord, self.grid_size)
+
+        if self.manifold_only:
+            if self.match_count:
+                sample_res = self._match_resolution_to_target(
+                    count_fn=lambda res: self._count_unique_voxels(manifold_coord, res),
+                    target_count=target_count,
+                    init_resolution=self.grid_size,
+                )
+            else:
+                sample_res = self.grid_size
+
+            idx_selected, inverse, selected_grid_coord = self._sample_manifold_only(
+                manifold_coord=manifold_coord,
+                resolution=sample_res,
+            )
+        else:
+            if self.match_count:
+                sample_res = self._match_resolution_to_target(
+                    count_fn=lambda res: self._count_joint_points(
+                        coord=coord,
+                        manifold_coord=manifold_coord,
+                        resolution=res,
+                    ),
+                    target_count=target_count,
+                    init_resolution=self.grid_size,
+                )
+            else:
+                sample_res = self.grid_size
+
+            idx_selected, inverse, selected_grid_coord = self._sample_joint(
+                coord=coord,
+                manifold_coord=manifold_coord,
+                resolution=sample_res,
+            )
+
+        return self._finalize_output(
+            data_dict=data_dict,
+            idx_selected=idx_selected,
+            inverse=inverse,
+            grid_coord=selected_grid_coord,
+        )
+
+    # -------------------------------------------------------------------------
+    # Core geometry
+    # -------------------------------------------------------------------------
+    def _compute_manifold_coord(self, coord, normal):
         ray_norm = np.linalg.norm(coord, axis=1, keepdims=True)
-        view_dir = coord / np.maximum(ray_norm, self.eps)
+        r = np.maximum(ray_norm, self.eps)
+        view_dir = coord / r
 
-        # incidence term: |n · v|
-        gamma = np.abs(np.sum(normal * view_dir, axis=1))
-        gamma = np.maximum(gamma, self.incidence_min)
-        manifold_coord = coord * np.sqrt(gamma)[:, None]
+        normal_norm = np.linalg.norm(normal, axis=1, keepdims=True)
+        normal = normal / np.maximum(normal_norm, self.eps)
 
-        scaled_coord = manifold_coord / np.array(self.mani_res)
-        grid_coord = np.floor(scaled_coord).astype(int)
+        ndotv = np.abs(np.sum(normal * view_dir, axis=1, keepdims=True))
+        ndotv = np.clip(ndotv, self.incidence_min, 1.0)
 
-        min_coord = grid_coord.min(0)
-        grid_coord -= min_coord
+        r0 = self._get_r0(r)
+
+        if self.center_radius > 0.0:
+            r_cap = np.maximum(r, self.center_radius)
+        else:
+            r_cap = r
+
+        scale = np.sqrt(ndotv) * np.power(r0 / r_cap, self.beta)
+        manifold_coord = coord * scale
+        return manifold_coord
+
+    # -------------------------------------------------------------------------
+    # Voxelization core
+    # -------------------------------------------------------------------------
+    def _voxelize(self, coord, resolution):
+        grid_coord = np.floor(coord / resolution).astype(np.int64)
+        grid_coord -= grid_coord.min(0, keepdims=True)
 
         key = self.fnv_hash_vec(grid_coord)
         idx_sort = np.argsort(key)
         key_sort = key[idx_sort]
-        _, inverse, count = np.unique(key_sort, return_inverse=True, return_counts=True)
-
-        idx_select = (
-            np.cumsum(np.insert(count, 0, 0)[:-1])
-            + np.random.randint(0, count.max(), count.size) % count
+        _, inverse_sort, count = np.unique(
+            key_sort, return_inverse=True, return_counts=True
         )
+
+        idx_select = np.cumsum(np.insert(count, 0, 0)[:-1])
         idx_unique = idx_sort[idx_select]
-        data_dict = index_operator(data_dict, idx_unique)
+
+        inverse = np.empty_like(inverse_sort)
+        inverse[idx_sort] = inverse_sort
+
+        return idx_unique, inverse, grid_coord
+
+    def _sample_manifold_only(self, manifold_coord, resolution):
+        idx_unique, inverse, grid_coord = self._voxelize(manifold_coord, resolution)
+        selected_grid_coord = grid_coord[idx_unique]
+        return idx_unique, inverse, selected_grid_coord
+
+    def _sample_joint(self, coord, manifold_coord, resolution):
+        n = coord.shape[0]
+
+        all_coord = np.concatenate([coord, manifold_coord], axis=0)
+        all_orig_idx = np.concatenate(
+            [np.arange(n, dtype=np.int64), np.arange(n, dtype=np.int64)], axis=0
+        )
+
+        idx_unique_cand, cand_inverse_group, all_grid_coord = self._voxelize(
+            all_coord, resolution
+        )
+
+        idx_selected = np.unique(all_orig_idx[idx_unique_cand])
+        idx_selected = np.sort(idx_selected)
+
+        selected_pos = np.full(n, -1, dtype=np.int64)
+        selected_pos[idx_selected] = np.arange(idx_selected.shape[0], dtype=np.int64)
+
+        rep_orig_idx = all_orig_idx[idx_unique_cand]
+        group_to_pos = selected_pos[rep_orig_idx]
+        cand_rep_pos = group_to_pos[cand_inverse_group]
+
+        inverse = np.full(n, -1, dtype=np.int64)
+        for i in range(n):
+            pos_orig = cand_rep_pos[i]
+            pos_mani = cand_rep_pos[i + n]
+
+            if pos_orig >= 0:
+                inverse[i] = pos_orig
+            elif pos_mani >= 0:
+                inverse[i] = pos_mani
+
+        unresolved = np.where(inverse < 0)[0]
+        if unresolved.size > 0:
+            inverse[unresolved] = 0
+
+        selected_grid_coord = np.full((idx_selected.shape[0], 3), 0, dtype=np.int64)
+        filled = np.zeros(idx_selected.shape[0], dtype=bool)
+
+        for cand_idx in idx_unique_cand:
+            orig_idx = all_orig_idx[cand_idx]
+            pos = selected_pos[orig_idx]
+            if pos >= 0 and not filled[pos]:
+                selected_grid_coord[pos] = all_grid_coord[cand_idx]
+                filled[pos] = True
+
+        return idx_selected, inverse, selected_grid_coord
+
+    # -------------------------------------------------------------------------
+    # Matching
+    # -------------------------------------------------------------------------
+    def _match_resolution_to_target(
+        self,
+        count_fn,
+        target_count,
+        init_resolution,
+    ):
+        target_count = max(int(target_count), 1)
+        low = max(init_resolution * self.match_low_scale, self.eps)
+        high = init_resolution * self.match_high_scale
+
+        def eval_count(res):
+            c = int(count_fn(res))
+            e = abs(c - target_count) / target_count
+            return c, e
+
+        low_count, low_err = eval_count(low)
+        high_count, high_err = eval_count(high)
+
+        best_res, best_err = low, low_err
+        if high_err < best_err:
+            best_res, best_err = high, high_err
+
+        if best_err <= self.match_tol:
+            return best_res
+
+        for _ in range(self.match_max_iter):
+            if low_count >= target_count >= high_count:
+                break
+
+            if low_count > target_count and high_count > target_count:
+                low = high
+                low_count, low_err = high_count, high_err
+                high = high * 1.5
+                high_count, high_err = eval_count(high)
+            elif low_count < target_count and high_count < target_count:
+                high = low
+                high_count, high_err = low_count, low_err
+                low = max(low / 1.5, self.eps)
+                low_count, low_err = eval_count(low)
+            else:
+                break
+
+            if low_err < best_err:
+                best_res, best_err = low, low_err
+            if high_err < best_err:
+                best_res, best_err = high, high_err
+
+            if best_err <= self.match_tol:
+                return best_res
+
+        for _ in range(self.match_max_iter):
+            mid = 0.5 * (low + high)
+            mid_count, mid_err = eval_count(mid)
+
+            if mid_err < best_err:
+                best_res, best_err = mid, mid_err
+
+            if mid_err <= self.match_tol:
+                return mid
+
+            if mid_count > target_count:
+                low = mid
+            else:
+                high = mid
+
+        return best_res
+
+    def _count_joint_points(self, coord, manifold_coord, resolution):
+        idx_selected, _, _ = self._sample_joint(coord, manifold_coord, resolution)
+        return int(idx_selected.shape[0])
+
+    def _count_unique_voxels(self, coord, voxel_size):
+        grid_coord = np.floor(coord / voxel_size).astype(np.int64)
+        grid_coord -= grid_coord.min(0, keepdims=True)
+        key = self.fnv_hash_vec(grid_coord)
+        return np.unique(key).shape[0]
+
+    # -------------------------------------------------------------------------
+    # Output packaging
+    # -------------------------------------------------------------------------
+    def _finalize_output(self, data_dict, idx_selected, inverse, grid_coord):
+        data_dict = index_operator(data_dict, idx_selected)
+
+        for k, v in data_dict.items():
+            if isinstance(v, np.ndarray) and not v.flags["C_CONTIGUOUS"]:
+                data_dict[k] = np.ascontiguousarray(v)
 
         if self.return_inverse:
-            data_dict["inverse"] = np.zeros_like(inverse)
-            data_dict["inverse"][idx_sort] = inverse
+            data_dict["inverse"] = inverse
 
         if self.return_grid_coord:
-            data_dict["grid_coord"] = grid_coord[idx_unique]
+            data_dict["grid_coord"] = grid_coord
             if "grid_coord" not in data_dict["index_valid_keys"]:
                 data_dict["index_valid_keys"].append("grid_coord")
 
         return data_dict
 
+    def _parse_r0_mode(self, r0_mode):
+        if isinstance(r0_mode, (int, float)):
+            return "fixed", float(r0_mode)
+
+        if isinstance(r0_mode, str):
+            s = r0_mode.strip().lower()
+            if s in ["median", "mean", "percentile", "fixed"]:
+                return s, None
+            try:
+                v = float(s)
+                return "fixed", v
+            except ValueError:
+                pass
+
+        raise ValueError(
+            "r0_mode must be one of ['median', 'mean', 'percentile'] "
+        )
+
+    def _get_r0(self, r):
+        r_flat = np.asarray(r).reshape(-1)
+
+        if self.r0_mode == "median":
+            r0 = float(np.median(r_flat))
+        elif self.r0_mode == "mean":
+            r0 = float(np.mean(r_flat))
+        elif self.r0_mode == "percentile":
+            r0 = float(np.percentile(r_flat, self.percentile_q))
+        else:
+            raise ValueError(f"Unsupported r0_mode: {self.r0_mode}")
+
+        return max(r0, self.eps)
+
     @staticmethod
     def fnv_hash_vec(arr):
-        """
-        FNV64-1A
-        """
         assert arr.ndim == 2
         arr = arr.copy()
         arr = arr.astype(np.uint64, copy=False)
@@ -1287,16 +1540,19 @@ class ManifoldSample(object):
 class SceneSampling(object):
     def __init__(
         self,
-        mode="grid",                 # "base" | "grid" | "manifold"
-        sample_res=0.05,             
+        mode="grid",
+        sample_res=0.09,
+        manifold_only=False,   # default = joint manifold mode
+        match_count=True,
         return_inverse=False,
         return_grid_coord=False,
     ):
         self.mode = str(mode).lower()
         assert self.mode in ["grid", "manifold"], f"Unknown mode: {mode}"
 
-
         self.sample_res = sample_res
+        self.manifold_only = manifold_only
+        self.match_count = match_count
         self.return_inverse = return_inverse
         self.return_grid_coord = return_grid_coord
 
@@ -1307,24 +1563,20 @@ class SceneSampling(object):
                 return_inverse=self.return_inverse,
                 return_grid_coord=self.return_grid_coord,
             )
-
         elif self.mode == "manifold":
             self.sampler = ManifoldSample(
-                mani_res=self.sample_res,
+                grid_size=self.sample_res,
+                manifold_only=self.manifold_only,
+                match_count=self.match_count,
                 return_inverse=self.return_inverse,
                 return_grid_coord=self.return_grid_coord,
             )
-
-        else:  
+        else:
             self.sampler = None
 
     def __call__(self, data_dict):
         if data_dict["coord"].shape[0] == 0:
             return data_dict
-
-        if self.mode == "base":
-            return data_dict
-
         return self.sampler(data_dict)
     
 
@@ -1338,13 +1590,15 @@ class SceneFragmentation(object):
         point_min=8192,   
         max_radius=0,          
         seed=None,
+        crop_shape="cylinder",
         rare_class_ids=None, # (3, 5, 6),
         azimuthShift=True,
     ):
-        assert mode.lower() in ["base", "scanbin", "spherecrop"]
+        assert mode.lower() in ["base", "scanbin"]
         assert split_mode in ["train", "test"]
+        assert crop_shape.lower() in ["cylinder", "sphere"]
 
-        self.mode = "base" if mode.lower() == "spherecrop" else mode.lower()
+        self.mode = mode.lower()
         self.split_mode = split_mode
         self.point_max = int(point_max)
         self.point_min = int(point_min)
@@ -1359,10 +1613,12 @@ class SceneFragmentation(object):
         except Exception:
             self._cKDTree = None
 
+        self.use_xy = (crop_shape == "cylinder")
         self.rare_class_ids = tuple(int(x) for x in rare_class_ids) if rare_class_ids is not None else tuple()
         self.azimuthShift = bool(azimuthShift)
         self.az_min = float(0.0)
         self.az_max = float(2.0 * np.pi)
+
 
     def __call__(self, data_dict):
         assert "coord" in data_dict
@@ -1388,10 +1644,13 @@ class SceneFragmentation(object):
         return fragments
 
     def _base_fragmentation(self, data_dict, coord: np.ndarray, M: int):
-        d2_tree = self._cKDTree(coord[:,:2]) if self._cKDTree is not None else None  
+        if self._cKDTree is not None:
+            tree = self._cKDTree(coord[:, :2]) if self.use_xy else self._cKDTree(coord)
+        else:
+            tree = None
 
         fragments, _ = self._sample_from_random_anchor(
-            data_dict, coord, M, d2_tree
+            data_dict, coord, M, tree
             )
         return fragments
     
@@ -1414,18 +1673,19 @@ class SceneFragmentation(object):
 
             for anchor_idx in anchor_indices:
                 anchor_idx = int(anchor_idx)
-                idx = self._neighbor_indices(coord, coord[anchor_idx], tree)
+                idx = self._neighbor_indices(coord, coord[anchor_idx], tree, use_xy=self.use_xy)
 
                 if idx.size < self.point_min:
                     continue
 
                 fragments.append(self._make_fragment(data_dict, idx))
                 covered[idx] = True
+           
 
             fragments, covered = self._ensure_coverage(
                 data_dict, coord, tree, fragments, covered
                 )
-            
+                
             if self.split_mode == "train" and self.rare_class_ids:
                 fragments, covered = self._boost_rare_base(
                     data_dict, coord, tree, fragments, covered
@@ -1465,10 +1725,14 @@ class SceneFragmentation(object):
                 continue
 
             if self._cKDTree is not None:
-                bin_trees[b] = self._cKDTree(coord[idx_bin, :2])
+                if self.use_xy_crop:
+                    bin_trees[b] = self._cKDTree(coord[idx_bin, :2])
+                else:
+                    bin_trees[b] = self._cKDTree(coord[idx_bin])
+
                 
             anchor = coord[int(self.rng.choice(idx_bin))]
-            idx_local = self._neighbor_indices(coord[idx_bin], anchor, bin_trees[b], use_xy=True)
+            idx_local = self._neighbor_indices(coord[idx_bin], anchor, bin_trees[b], use_xy=self.use_xy)
             idx_bin_sel = idx_bin[idx_local]
 
             if idx_bin_sel.size < self.point_min:
@@ -1501,7 +1765,7 @@ class SceneFragmentation(object):
                 break
 
             anchor_idx = int(self.rng.choice(uncovered, size=1)[0])
-            idx = self._neighbor_indices(coord, coord[anchor_idx], tree)
+            idx = self._neighbor_indices(coord, coord[anchor_idx], tree, use_xy=self.use_xy)
 
             if idx.size < self.point_min:
                 covered[anchor_idx] = True
@@ -1541,7 +1805,7 @@ class SceneFragmentation(object):
                 covered[cidx] = True
                 continue
             
-            idx_local = self._neighbor_indices(coord[idx_bin], coord[cidx], bin_trees[b], use_xy=True)
+            idx_local = self._neighbor_indices(coord[idx_bin], coord[cidx], bin_trees[b], use_xy=self.use_xy)
             idx_bin_sel = idx_bin[idx_local]
 
             azimuth = self._bin_center_angle(edges[b], edges[b + 1]) if self.azimuthShift else None
@@ -1579,7 +1843,7 @@ class SceneFragmentation(object):
                 trials += 1
 
                 anchor_idx = int(self.rng.choice(class_idx))
-                idx = self._neighbor_indices(coord, coord[anchor_idx], tree)
+                idx = self._neighbor_indices(coord, coord[anchor_idx], tree, use_xy=self.use_xy)
 
                 if idx.size < self.point_min:
                     covered[anchor_idx] = True
@@ -1595,7 +1859,7 @@ class SceneFragmentation(object):
                 added += 1
 
         return fragments, covered
-
+    
     def _neighbor_indices(
         self,
         coord: np.ndarray,
@@ -1607,11 +1871,38 @@ class SceneFragmentation(object):
             anchor = np.asarray(anchor, dtype=np.float64).reshape(-1)[:2]
             coord_query = coord[:, :2]
         else:
-            anchor = np.asarray(anchor, dtype=np.float64).reshape(-1)[: coord.shape[1]]
-            coord_query = coord
+            anchor = np.asarray(anchor, dtype=np.float64).reshape(-1)[:3]
+            coord_query = coord[:, :3]
 
-        k = min(self.point_max, coord.shape[0])
+        n = coord.shape[0]
+        if n == 0:
+            return np.empty(0, dtype=np.int64)
 
+        k = min(self.point_max, n)
+
+        # 1) max_radius first
+        if self.max_radius is not None:
+            if tree is not None:
+                idx = tree.query_ball_point(anchor, r=self.max_radius)
+                idx = np.asarray(idx, dtype=np.int64)
+            else:
+                r2 = float(self.max_radius) ** 2
+                dist2 = np.sum((coord_query - anchor) ** 2, axis=1)
+                idx = np.where(dist2 <= r2)[0].astype(np.int64)
+
+            if idx.size > k:
+                idx = np.random.choice(idx, size=k, replace=False)
+            return idx.astype(np.int64)
+
+            # if too many points inside radius, keep only nearest k
+            # if idx.size > k:
+            #     pts = coord_query[idx]
+            #     dist2_local = np.sum((pts - anchor) ** 2, axis=1)
+            #     sel = np.argpartition(dist2_local, kth=k - 1)[:k]
+            #     idx = idx[sel]
+            
+
+        # 2) otherwise fallback to original kNN behavior
         if tree is not None:
             _, idx = tree.query(anchor, k=k)
             idx = np.asarray(idx, dtype=np.int64)
@@ -1620,11 +1911,6 @@ class SceneFragmentation(object):
             idx = np.argpartition(dist2, kth=k - 1)[:k].astype(np.int64)
 
         idx = np.atleast_1d(idx)
-
-        if self.max_radius is not None:
-            pts = coord_query[idx]
-            keep = np.sum((pts - anchor) ** 2, axis=1) <= (self.max_radius ** 2)
-            idx = idx[keep]
         return idx
 
     def _make_fragment(self, data_dict, idx: np.ndarray, azimuth=None):
@@ -1646,4 +1932,564 @@ class SceneFragmentation(object):
         out = coord.copy()
         out[:, :2] = out[:, :2] @ R.T
         return out
+    
 
+@TRANSFORMS.register_module()
+class ManifoldValidationFragmentation(object):
+    """
+    Validation fragmentation for same receptive-region comparison.
+
+    Pipeline inside this class:
+      1) Grid sample full augmented scene
+      2) Fragment grid-sampled scene using base fragmentation policy
+         - train: rare anchor boost
+         - test: ensure coverage
+      3) Record anchor + effective radius (max XY distance)
+      4) Build target sampled scene
+         - target_mode="manifold": manifold sample full scene
+         - target_mode="fps": use precomputed FPS indices
+      5) Build target fragments using the same anchor + effective radius
+
+    Notes
+    -----
+    - Grid anchors / radii are always defined on the grid-sampled scene.
+    - For manifold mode, `match_grid_size` matches the sampled point count
+      to standard grid sampling at that resolution, similar to ManifoldSample(match_grid_size=...).
+    - For FPS mode, this class does NOT run FPS. It only consumes precomputed FPS indices.
+    """
+
+    def __init__(
+        self,
+        split_mode="train",          # "train" | "test"
+        grid_res=0.09,
+        mani_res=None,
+        match_grid_size=None,        # if set, manifold voxel size is matched to grid compression ratio
+        target_mode="manifold",      # "manifold" | "fps"
+        fps_index_key="fps_index",   # precomputed FPS indices in original full scene
+        point_max=30000,
+        point_min=8192,
+        incidence_min=0.05,
+        match_tol=0.05,
+        match_max_iter=12,
+        seed=None,
+        rare_class_ids=None,
+        apply_point_cap=False,
+        return_inverse=False,
+        return_grid_coord=False,
+    ):
+        assert split_mode in ["train", "test"]
+        assert target_mode in ["manifold", "fps"]
+
+        if target_mode == "manifold":
+            if mani_res is None and match_grid_size is None:
+                raise ValueError(
+                    "For target_mode='manifold', either mani_res or match_grid_size must be provided."
+                )
+        if target_mode == "fps":
+            if fps_index_key is None:
+                raise ValueError("For target_mode='fps', fps_index_key must be provided.")
+
+        self.split_mode = split_mode
+        self.target_mode = target_mode
+
+        self.grid_res = float(grid_res)
+        self.mani_res = None if mani_res is None else float(mani_res)
+        self.match_grid_size = None if match_grid_size is None else float(match_grid_size)
+        self.fps_index_key = str(fps_index_key)
+
+        self.point_max = int(point_max)
+        self.point_min = int(point_min)
+        self.incidence_min = float(incidence_min)
+        self.match_tol = float(match_tol)
+        self.match_max_iter = int(match_max_iter)
+
+        self.apply_point_cap = bool(apply_point_cap)
+        self.return_inverse = bool(return_inverse)
+        self.return_grid_coord = bool(return_grid_coord)
+
+        self.rng = np.random.RandomState(seed) if seed is not None else np.random
+        self.max_extra_fragments = 10
+        self.rare_class_ids = tuple(int(x) for x in rare_class_ids) if rare_class_ids is not None else tuple()
+
+        try:
+            from scipy.spatial import cKDTree
+            self._cKDTree = cKDTree
+        except Exception:
+            self._cKDTree = None
+
+        self.eps = 1e-12
+
+    def __call__(self, data_dict):
+        assert "coord" in data_dict
+        assert "normal" in data_dict
+        assert "segment" in data_dict
+
+        if data_dict["coord"].shape[0] == 0:
+            return self._empty_return(data_dict)
+
+        # ------------------------------------------------------------
+        # 1) Grid sample full augmented scene
+        # ------------------------------------------------------------
+        grid_dict = self._grid_sample_full(data_dict, self.grid_res)
+        grid_coord = grid_dict["coord"]
+        N_grid = int(grid_coord.shape[0])
+
+        if N_grid == 0:
+            return self._empty_return(data_dict)
+
+        # ------------------------------------------------------------
+        # 2) Build fragment specs on grid-sampled scene
+        # ------------------------------------------------------------
+        frag_specs = self._build_grid_fragment_specs(grid_dict)
+
+        # ------------------------------------------------------------
+        # 3) Build target sampled full scene
+        # ------------------------------------------------------------
+        target_dict = self._build_target_sample_full(data_dict)
+        target_coord = target_dict["coord"]
+
+        if target_coord.shape[0] == 0:
+            return self._empty_return(data_dict, sampled_dict=target_dict)
+
+        tree_target = self._build_xy_tree(target_coord)
+
+        # ------------------------------------------------------------
+        # 4) Rebuild fragments on target sampled cloud
+        # ------------------------------------------------------------
+        parts = []
+        for spec in frag_specs:
+            idx = self._crop_by_anchor_radius(target_coord, spec["anchor"], spec["radius"], tree_target)
+            if idx.size < self.point_min:
+                continue
+
+            if self.apply_point_cap and idx.size > self.point_max:
+                idx = self.rng.choice(idx, size=self.point_max, replace=False)
+
+            part = index_operator(target_dict, idx, duplicate=True)
+            part["index"] = idx
+
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+
+            part["frag_anchor"] = spec["anchor"].reshape(1, 3).astype(np.float32)
+            part["frag_radius"] = np.array([spec["radius"]], dtype=np.float32)
+
+            if "index_valid_keys" in part:
+                if "frag_anchor" not in part["index_valid_keys"]:
+                    part["index_valid_keys"].append("frag_anchor")
+                if "frag_radius" not in part["index_valid_keys"]:
+                    part["index_valid_keys"].append("frag_radius")
+
+            parts.append(part)
+
+        # fallback
+        if len(parts) == 0:
+            idx = np.arange(target_coord.shape[0], dtype=np.int64)
+            if self.apply_point_cap and idx.size > self.point_max:
+                idx = self.rng.choice(idx, size=self.point_max, replace=False)
+
+            part = index_operator(target_dict, idx, duplicate=True)
+            part["index"] = idx
+            if "index_valid_keys" in part and "index" not in part["index_valid_keys"]:
+                part["index_valid_keys"].append("index")
+            parts = [part]
+
+        # ------------------------------------------------------------
+        # 5) Return
+        # ------------------------------------------------------------
+        if self.split_mode == "test":
+            out = {
+                "fragment_list": parts,
+            }
+            if "inverse" in target_dict:
+                out["inverse"] = target_dict["inverse"]
+                out["origin_segment"] = data_dict["segment"].copy()
+            else:
+                out["segment"] = target_dict["segment"].copy()
+            return out
+
+        return parts
+
+    # ============================================================
+    # Empty return
+    # ============================================================
+    def _empty_return(self, data_dict, sampled_dict=None):
+        if self.split_mode == "test":
+            out = {
+                "fragment_list": [],
+                "origin_segment": data_dict["segment"].copy(),
+            }
+            if sampled_dict is not None and "inverse" in sampled_dict:
+                out["inverse"] = sampled_dict["inverse"]
+            else:
+                out["inverse"] = np.zeros((0,), dtype=np.int64)
+            return out
+        return []
+
+    # ============================================================
+    # Grid fragment spec creation
+    # ============================================================
+    def _build_grid_fragment_specs(self, grid_dict):
+        coord = grid_dict["coord"]
+        N = int(coord.shape[0])
+
+        if N <= self.point_max:
+            return [self._make_frag_spec(coord, np.arange(N, dtype=np.int64))]
+
+        M = max(1, int(np.ceil(N / float(self.point_max))))
+        tree_grid = self._build_xy_tree(coord)
+
+        frag_specs, covered = self._sample_from_random_anchor(grid_dict, coord, M, tree_grid)
+
+        if self.split_mode == "test":
+            frag_specs, covered = self._ensure_coverage(coord, tree_grid, frag_specs, covered)
+
+        if self.split_mode == "train" and self.rare_class_ids:
+            frag_specs, covered = self._boost_rare(grid_dict, coord, tree_grid, frag_specs, covered)
+
+        return frag_specs
+
+    def _sample_from_random_anchor(self, data_dict, coord, num_fragments, tree=None):
+        frag_specs = []
+        covered = np.zeros(coord.shape[0], dtype=bool)
+
+        N = coord.shape[0]
+        if N == 0 or num_fragments <= 0:
+            return frag_specs, covered
+
+        replace = num_fragments > N
+        anchor_indices = self.rng.choice(N, size=num_fragments, replace=replace)
+
+        for anchor_idx in anchor_indices:
+            anchor_idx = int(anchor_idx)
+            idx = self._knn_indices(coord, coord[anchor_idx], tree)
+            if idx.size < self.point_min:
+                continue
+
+            frag_specs.append(self._make_frag_spec(coord, idx, anchor=coord[anchor_idx]))
+            covered[idx] = True
+
+        return frag_specs, covered
+
+    def _ensure_coverage(self, coord, tree, frag_specs, covered):
+        extra_added = 0
+        while extra_added < self.max_extra_fragments:
+            uncovered = np.where(~covered)[0]
+            if uncovered.size == 0:
+                break
+
+            anchor_idx = int(self.rng.choice(uncovered, size=1)[0])
+            idx = self._knn_indices(coord, coord[anchor_idx], tree)
+
+            if idx.size < self.point_min:
+                covered[anchor_idx] = True
+                continue
+
+            frag_specs.append(self._make_frag_spec(coord, idx, anchor=coord[anchor_idx]))
+            covered[idx] = True
+            extra_added += 1
+
+        return frag_specs, covered
+
+    def _boost_rare(self, data_dict, coord, tree, frag_specs, covered):
+        labels = np.asarray(data_dict["segment"]).reshape(-1)
+        target_per_class = max(1, int(len(frag_specs) // 5))
+
+        seen = set()
+        for spec in frag_specs:
+            sig = (
+                round(float(spec["anchor"][0]), 6),
+                round(float(spec["anchor"][1]), 6),
+                round(float(spec["radius"]), 6),
+            )
+            seen.add(sig)
+
+        for cid in self.rare_class_ids:
+            class_idx = np.where(labels == cid)[0].astype(np.int64)
+            if class_idx.size == 0:
+                continue
+
+            added = 0
+            trials = 0
+            max_trials = target_per_class * 5
+
+            while added < target_per_class and trials < max_trials:
+                trials += 1
+
+                anchor_idx = int(self.rng.choice(class_idx))
+                idx = self._knn_indices(coord, coord[anchor_idx], tree)
+
+                if idx.size < self.point_min:
+                    covered[anchor_idx] = True
+                    continue
+
+                spec = self._make_frag_spec(coord, idx, anchor=coord[anchor_idx])
+                sig = (
+                    round(float(spec["anchor"][0]), 6),
+                    round(float(spec["anchor"][1]), 6),
+                    round(float(spec["radius"]), 6),
+                )
+                if sig in seen:
+                    continue
+
+                seen.add(sig)
+                frag_specs.append(spec)
+                covered[idx] = True
+                added += 1
+
+        return frag_specs, covered
+
+    def _make_frag_spec(self, coord, idx, anchor=None):
+        pts_xy = coord[idx, :2]
+        if anchor is None:
+            anchor = coord[idx[0]]
+        anchor = np.asarray(anchor, dtype=np.float64).reshape(-1)
+
+        dist_xy = np.sqrt(np.sum((pts_xy - anchor[:2]) ** 2, axis=1))
+        eff_radius = float(dist_xy.max()) if dist_xy.size > 0 else 0.0
+
+        return {
+            "anchor": anchor.astype(np.float32),
+            "radius": eff_radius,
+        }
+
+    # ============================================================
+    # Rebuild on target cloud
+    # ============================================================
+    def _crop_by_anchor_radius(self, coord, anchor, radius, tree=None):
+        anchor_xy = np.asarray(anchor, dtype=np.float64).reshape(-1)[:2]
+        radius = float(radius)
+
+        if tree is not None:
+            idx = tree.query_ball_point(anchor_xy, r=radius)
+            return np.asarray(idx, dtype=np.int64)
+
+        dist2 = np.sum((coord[:, :2] - anchor_xy) ** 2, axis=1)
+        return np.where(dist2 <= radius * radius)[0].astype(np.int64)
+
+    def _knn_indices(self, coord, anchor, tree=None):
+        k = min(self.point_max, coord.shape[0])
+        if tree is not None:
+            _, idx = tree.query(np.asarray(anchor[:2], dtype=np.float64), k=k)
+            idx = np.asarray(idx, dtype=np.int64)
+        else:
+            dist2 = np.sum((coord[:, :2] - anchor[:2]) ** 2, axis=1)
+            idx = np.argpartition(dist2, kth=k - 1)[:k].astype(np.int64)
+        return np.atleast_1d(idx)
+
+    def _build_xy_tree(self, coord):
+        if self._cKDTree is None:
+            return None
+        return self._cKDTree(coord[:, :2])
+
+    # ============================================================
+    # Target scene builder
+    # ============================================================
+    def _build_target_sample_full(self, data_dict):
+        if self.target_mode == "manifold":
+            return self._manifold_sample_full(
+                data_dict,
+                mani_res=self.mani_res,
+                match_grid_size=self.match_grid_size,
+            )
+        elif self.target_mode == "fps":
+            return self._fps_sample_full(
+                data_dict,
+                fps_index_key=self.fps_index_key,
+            )
+        else:
+            raise NotImplementedError
+
+    # ============================================================
+    # Full-scene grid sample
+    # ============================================================
+    def _grid_sample_full(self, data_dict, grid_size):
+        coord = data_dict["coord"]
+        scaled_coord = coord / np.array(grid_size)
+        grid_coord = np.floor(scaled_coord).astype(np.int64)
+        min_coord = grid_coord.min(0)
+        grid_coord = grid_coord - min_coord
+
+        key = self._fnv_hash_vec(grid_coord)
+        idx_sort = np.argsort(key)
+        key_sort = key[idx_sort]
+        _, inverse, count = np.unique(key_sort, return_inverse=True, return_counts=True)
+
+        idx_select = (
+            np.cumsum(np.insert(count, 0, 0)[:-1])
+            + self.rng.randint(0, count.max(), count.size) % count
+        )
+        idx_unique = idx_sort[idx_select]
+
+        out = index_operator(data_dict, idx_unique, duplicate=True)
+
+        if "index_valid_keys" not in out:
+            out["index_valid_keys"] = []
+
+        if self.return_grid_coord:
+            out["grid_coord"] = grid_coord[idx_unique]
+            if "grid_coord" not in out["index_valid_keys"]:
+                out["index_valid_keys"].append("grid_coord")
+
+        if self.return_inverse:
+            inv_full = np.zeros_like(inverse)
+            inv_full[idx_sort] = inverse
+            out["inverse"] = inv_full
+            if "inverse" not in out["index_valid_keys"]:
+                out["index_valid_keys"].append("inverse")
+
+        return out
+
+    # ============================================================
+    # Full-scene manifold sample
+    # ============================================================
+    def _manifold_sample_full(self, data_dict, mani_res=None, match_grid_size=None):
+        coord = data_dict["coord"]
+        normal = data_dict["normal"]
+
+        ray_norm = np.linalg.norm(coord, axis=1, keepdims=True)
+        view_dir = coord / np.maximum(ray_norm, self.eps)
+
+        normal_norm = np.linalg.norm(normal, axis=1, keepdims=True)
+        normal_u = normal / np.maximum(normal_norm, self.eps)
+
+        ndotv = np.abs(np.sum(normal_u * view_dir, axis=1))
+        ndotv = np.maximum(ndotv, self.incidence_min)
+
+        manifold_coord = coord * np.sqrt(ndotv)[:, None]
+        gamma_h = float(np.mean(ndotv))
+
+        if match_grid_size is not None:
+            target_count = self._count_unique_voxels(coord, float(match_grid_size))
+            init_voxel = float(match_grid_size) * np.sqrt(gamma_h)
+            voxel_size = self._match_voxel_size(
+                manifold_coord=manifold_coord,
+                target_count=target_count,
+                init_voxel=init_voxel,
+                tol=self.match_tol,
+                max_iter=self.match_max_iter,
+            )
+        else:
+            voxel_size = float(mani_res) * np.sqrt(gamma_h)
+
+        scaled_coord = manifold_coord / np.array(voxel_size)
+        grid_coord = np.floor(scaled_coord).astype(np.int64)
+        min_coord = grid_coord.min(0)
+        grid_coord = grid_coord - min_coord
+
+        key = self._fnv_hash_vec(grid_coord)
+        idx_sort = np.argsort(key)
+        key_sort = key[idx_sort]
+        _, inverse, count = np.unique(key_sort, return_inverse=True, return_counts=True)
+
+        idx_select = (
+            np.cumsum(np.insert(count, 0, 0)[:-1])
+            + self.rng.randint(0, count.max(), count.size) % count
+        )
+        idx_unique = idx_sort[idx_select]
+
+        out = index_operator(data_dict, idx_unique, duplicate=True)
+
+        if "index_valid_keys" not in out:
+            out["index_valid_keys"] = []
+
+        if self.return_inverse:
+            inv_full = np.zeros_like(inverse)
+            inv_full[idx_sort] = inverse
+            out["inverse"] = inv_full
+            if "inverse" not in out["index_valid_keys"]:
+                out["index_valid_keys"].append("inverse")
+
+        if self.return_grid_coord:
+            out["grid_coord"] = grid_coord[idx_unique]
+            if "grid_coord" not in out["index_valid_keys"]:
+                out["index_valid_keys"].append("grid_coord")
+
+        return out
+
+    def _match_voxel_size(
+        self,
+        manifold_coord,
+        target_count,
+        init_voxel,
+        tol=0.05,
+        max_iter=12,
+    ):
+        target_count = max(int(target_count), 1)
+        best_voxel = init_voxel
+        best_err = float("inf")
+
+        low = max(init_voxel, self.eps)
+        high = init_voxel * 2.0
+
+        count_low = self._count_unique_voxels(manifold_coord, low)
+        count_high = self._count_unique_voxels(manifold_coord, high)
+
+        for v, c in [(low, count_low), (high, count_high)]:
+            err = abs(c - target_count) / target_count
+            if err < best_err:
+                best_err = err
+                best_voxel = v
+
+        if best_err <= tol:
+            return best_voxel
+
+        for _ in range(max_iter):
+            mid = 0.5 * (low + high)
+            count_mid = self._count_unique_voxels(manifold_coord, mid)
+            err = abs(count_mid - target_count) / target_count
+
+            if err < best_err:
+                best_err = err
+                best_voxel = mid
+
+            if err <= tol:
+                return mid
+
+            if count_mid > target_count:
+                low = mid
+            else:
+                high = mid
+
+        return best_voxel
+
+    def _count_unique_voxels(self, coord, voxel_size):
+        grid_coord = np.floor(coord / voxel_size).astype(np.int64)
+        grid_coord -= grid_coord.min(0, keepdims=True)
+        key = self._fnv_hash_vec(grid_coord)
+        return np.unique(key).shape[0]
+
+    # ============================================================
+    # Full-scene FPS sample from precomputed indices
+    # ============================================================
+    def _fps_sample_full(self, data_dict, fps_index_key="fps_index"):
+        if fps_index_key not in data_dict:
+            raise KeyError(
+                f"FPS mode requires precomputed indices in data_dict['{fps_index_key}']"
+            )
+
+        idx = np.asarray(data_dict[fps_index_key]).reshape(-1).astype(np.int64)
+        if idx.size == 0:
+            out = index_operator(data_dict, idx, duplicate=True)
+            if "index_valid_keys" not in out:
+                out["index_valid_keys"] = []
+            return out
+
+        out = index_operator(data_dict, idx, duplicate=True)
+
+        if "index_valid_keys" not in out:
+            out["index_valid_keys"] = []
+
+        # FPS is assumed precomputed, so inverse/grid_coord are not generated here.
+        # This class only reuses grid anchor + radius for cropping.
+        return out
+
+    @staticmethod
+    def _fnv_hash_vec(arr):
+        assert arr.ndim == 2
+        arr = arr.copy().astype(np.uint64, copy=False)
+        hashed_arr = np.uint64(14695981039346656037) * np.ones(arr.shape[0], dtype=np.uint64)
+        for j in range(arr.shape[1]):
+            hashed_arr *= np.uint64(1099511628211)
+            hashed_arr = np.bitwise_xor(hashed_arr, arr[:, j])
+        return hashed_arr

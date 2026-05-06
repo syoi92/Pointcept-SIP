@@ -347,81 +347,86 @@ class MultiDatasetTrainer(Trainer):
         )
         self.comm_info["iter_per_epoch"] = len(train_loader)
         return train_loader
-
-
-@TRAINERS.register_module("SIPFragmentTrainer")
-class SIPFragmentTrainer(Trainer):
     
-    def train(self):
-        return super().train()
 
-    def run_step(self):
+class _SIPTrainerMixin:
+    """
+    Shared utilities for SIP scene/fragment trainers.
+
+    fragment_batch_size: int
+        Number of fragments collated per forward.
+    min_last_fragment_batch: int, default=1
+        If the last fragment batch is smaller than this threshold,
+        merge it into the previous fragment batch.
+    """
+
+    def _get_autocast(self):
         if version.parse(torch.__version__) >= version.parse("2.4"):
-            auto_cast = partial(torch.amp.autocast, device_type="cuda")
+            return partial(torch.amp.autocast, device_type="cuda")
+        return torch.cuda.amp.autocast
+
+    def _get_fragment_ranges(self, num_fragments, frag_bs):
+        """
+        Split [0, num_fragments) into fragment mini-batches.
+        Optionally merge a tiny last batch into the previous one.
+        """
+        if num_fragments <= 0:
+            return []
+
+        ranges = []
+        s = 0
+        while s < num_fragments:
+            e = min(s + frag_bs, num_fragments)
+            ranges.append((s, e))
+            s = e
+
+        # default=1 -> no behavior change from current version
+        min_last = int(getattr(self.cfg, "min_last_fragment_batch", 1))
+
+        if (
+            min_last > 1
+            and len(ranges) >= 2
+            and (ranges[-1][1] - ranges[-1][0]) < min_last
+        ):
+            prev_s, _ = ranges[-2]
+            _, last_e = ranges[-1]
+            ranges[-2] = (prev_s, last_e)
+            ranges.pop(-1)
+
+        return ranges
+
+    def _move_to_cuda(self, input_dict):
+        for k, v in input_dict.items():
+            if isinstance(v, torch.Tensor):
+                input_dict[k] = v.cuda(non_blocking=True)
+        return input_dict
+
+    def _forward_loss(self, input_dict, auto_cast):
+        with auto_cast(enabled=self.cfg.enable_amp, dtype=AMP_DTYPE[self.cfg.amp_dtype]):
+            output_dict = self.model(input_dict)
+            loss = output_dict["loss"]
+        return output_dict, loss
+
+    def _backward(self, loss):
+        if self.cfg.enable_amp:
+            self.scaler.scale(loss).backward()
         else:
-            auto_cast = torch.cuda.amp.autocast
+            loss.backward()
 
-        batch = self.comm_info["input_dict"]
-        assert "fragment_list" in batch
-        scene_fragment_lists = batch["fragment_list"] 
-
-        frag_bs = getattr(self.cfg, "fragment_batch_size", 1)
-
-        total_frag_batches = 0
-        for flist in scene_fragment_lists:
-            total_frag_batches += max(1, (len(flist) + frag_bs - 1) // frag_bs)
-        total_frag_batches = max(1, total_frag_batches)
-
-        self.optimizer.zero_grad(set_to_none=True)
-
-        last_output = None
-
-        for fragment_list in scene_fragment_lists:
-            num_frag_batches = max(1, (len(fragment_list) + frag_bs - 1) // frag_bs)
-
-            # loop fragment batches
-            for i in range(num_frag_batches):
-                s = i * frag_bs
-                e = min((i + 1) * frag_bs, len(fragment_list))
-
-                input_dict = collate_fn(fragment_list[s:e])
-                for k, v in input_dict.items():
-                    if isinstance(v, torch.Tensor):
-                        input_dict[k] = v.cuda(non_blocking=True)
-
-                with auto_cast(enabled=self.cfg.enable_amp, dtype=AMP_DTYPE[self.cfg.amp_dtype]):
-                    output_dict = self.model(input_dict)
-                    loss = output_dict["loss"] #/ num_frag_batches  # scale so total ~1 scene
-
-                if self.cfg.enable_amp:
-                    self.scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-                
-                last_output = output_dict
-
-        # optimizer step
+    def _optimizer_step(self):
         if self.cfg.enable_amp:
             self.scaler.unscale_(self.optimizer)
             if self.cfg.clip_grad is not None:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_grad)
             self.scaler.step(self.optimizer)
-
-            scaler = self.scaler.get_scale()
             self.scaler.update()
-            if scaler <= self.scaler.get_scale():
-                self.scheduler.step()
         else:
             if self.cfg.clip_grad is not None:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_grad)
             self.optimizer.step()
-            self.scheduler.step()
 
-        if self.cfg.empty_cache:
-            torch.cuda.empty_cache()
-
-        if last_output is not None:
-            self.comm_info["model_output_dict"] = last_output
+    def _scheduler_step(self):
+        self.scheduler.step()
 
     def build_train_loader(self):
         train_data = build_dataset(self.cfg.data.train)
@@ -474,7 +479,7 @@ class SIPFragmentTrainer(Trainer):
             sampler=val_sampler,
             collate_fn=self._sip_collate_fn,
         )
-    
+
     @staticmethod
     def _sip_collate_fn(batch):
         out = {}
@@ -485,3 +490,182 @@ class SIPFragmentTrainer(Trainer):
                 out[k] = collate_fn([b[k] for b in batch])
         return out
 
+
+@TRAINERS.register_module("SIPSceneTrainer")
+class SIPSceneTrainer(_SIPTrainerMixin, Trainer):
+    """
+    Current behavior:
+    - forward/backward over fragment mini-batches
+    - one optimizer update per scene-batch
+    """
+
+    def train(self):
+        return super().train()
+
+    def run_step(self):
+        auto_cast = self._get_autocast()
+
+        batch = self.comm_info["input_dict"]
+        assert "fragment_list" in batch
+        scene_fragment_lists = batch["fragment_list"]
+
+        frag_bs = int(getattr(self.cfg, "fragment_batch_size", 1))
+
+        self.optimizer.zero_grad(set_to_none=True)
+        last_output = None
+
+        for fragment_list in scene_fragment_lists:
+            frag_ranges = self._get_fragment_ranges(len(fragment_list), frag_bs)
+            num_frag_batches = max(1, len(frag_ranges))
+
+            for s, e in frag_ranges:
+                input_dict = collate_fn(fragment_list[s:e])
+                input_dict = self._move_to_cuda(input_dict)
+
+                output_dict, loss = self._forward_loss(input_dict, auto_cast)
+                loss = loss #/ num_frag_batches
+
+                self._backward(loss)
+                last_output = output_dict
+
+        self._optimizer_step()
+        self._scheduler_step()
+
+        if self.cfg.empty_cache:
+            torch.cuda.empty_cache()
+
+        if last_output is not None:
+            self.comm_info["model_output_dict"] = last_output
+
+
+@TRAINERS.register_module("SIPFragmentTrainer")
+class SIPFragmentTrainer(_SIPTrainerMixin, Trainer):
+    """
+    Fragment-batch update behavior:
+    - forward/backward/optimizer-step per fragment mini-batch
+    - BN stats, gradient, optimizer update all aligned at fragment-batch scale
+    """
+
+    def build_scheduler(self):
+        assert hasattr(self, "optimizer")
+        max_update = int(getattr(self.cfg, "max_update", 0))
+        assert max_update > 0, "SIPFragmentTrainer requires cfg.max_update > 0"
+        self.cfg.scheduler.total_steps = max_update
+        return build_scheduler(self.cfg.scheduler, self.optimizer)
+
+    def train(self):
+        max_update = int(getattr(self.cfg, "max_update", 0))
+        assert max_update > 0, "SIPFragmentTrainer requires cfg.max_update > 0"
+
+        self.max_iter = max_update
+        self.comm_info["global_update_step"] = 0
+
+        with EventStorage() as self.storage, ExceptionWriter():
+            self.before_train()
+            self.logger.info(">>>>>>>>>>>>>>>> Start Training >>>>>>>>>>>>>>>>")
+
+            stop_training = False
+            while not stop_training:
+                if comm.get_world_size() > 1:
+                    self.train_loader.sampler.set_epoch(self.epoch)
+                self.model.train()
+                self.data_iterator = enumerate(self.train_loader)
+                self.before_epoch()
+
+                for (
+                    self.comm_info["iter"],
+                    self.comm_info["input_dict"],
+                ) in self.data_iterator:
+                    self.before_step()
+                    self.run_step()
+                    self.after_step()
+
+                    if self.comm_info["global_update_step"] >= max_update:
+                        stop_training = True
+                        break
+
+                self.after_epoch()
+                self.epoch += 1
+
+            self.after_train()
+
+    def run_step(self):
+        auto_cast = self._get_autocast()
+
+        batch = self.comm_info["input_dict"]
+        assert "fragment_list" in batch
+        scene_fragment_lists = batch["fragment_list"]
+
+        frag_bs = int(getattr(self.cfg, "fragment_batch_size", 1))
+        max_update = int(getattr(self.cfg, "max_update", 0))
+        last_output = None
+
+        update_in_this_loader_step = 0
+
+        for fragment_list in scene_fragment_lists:
+            frag_ranges = self._get_fragment_ranges(len(fragment_list), frag_bs)
+
+            for s, e in frag_ranges:
+                if self.comm_info["global_update_step"] >= max_update:
+                    break
+
+                self.optimizer.zero_grad(set_to_none=True)
+
+                input_dict = collate_fn(fragment_list[s:e])
+                input_dict = self._move_to_cuda(input_dict)
+
+                output_dict, loss = self._forward_loss(input_dict, auto_cast)
+                self._backward(loss)
+                self._optimizer_step()
+                self._scheduler_step()
+
+                self.comm_info["global_update_step"] += 1
+                update_in_this_loader_step += 1
+                last_output = output_dict
+
+            if self.comm_info["global_update_step"] >= max_update:
+                break
+
+        if self.cfg.empty_cache:
+            torch.cuda.empty_cache()
+
+        if last_output is not None:
+            self.comm_info["model_output_dict"] = last_output
+
+        self.comm_info["update_in_step"] = update_in_this_loader_step
+    
+    # def train(self):
+    #     return super().train()
+
+    # def run_step(self):
+    #     auto_cast = self._get_autocast()
+
+    #     batch = self.comm_info["input_dict"]
+    #     assert "fragment_list" in batch
+    #     scene_fragment_lists = batch["fragment_list"]
+
+    #     frag_bs = int(getattr(self.cfg, "fragment_batch_size", 1))
+    #     last_output = None
+
+    #     for fragment_list in scene_fragment_lists:
+    #         frag_ranges = self._get_fragment_ranges(len(fragment_list), frag_bs)
+
+    #         for s, e in frag_ranges:
+    #             self.optimizer.zero_grad(set_to_none=True)
+
+    #             input_dict = collate_fn(fragment_list[s:e])
+    #             input_dict = self._move_to_cuda(input_dict)
+
+    #             output_dict, loss = self._forward_loss(input_dict, auto_cast)
+    #             self._backward(loss)
+    #             self._optimizer_step()
+
+    #             last_output = output_dict
+            
+    #         self._scheduler_step()
+
+    #     if self.cfg.empty_cache:
+    #         torch.cuda.empty_cache()
+
+    #     if last_output is not None:
+    #         self.comm_info["model_output_dict"] = last_output

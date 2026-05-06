@@ -131,9 +131,10 @@ class SemSegEvaluator(HookBase):
             pred = output.max(1)[1]
             segment = input_dict["segment"]
             if "inverse" in input_dict.keys():
-                assert "origin_segment" in input_dict.keys()
+                # assert "origin_segment" in input_dict.keys()
+                # segment = input_dict["origin_segment"]
                 pred = pred[input_dict["inverse"]]
-                segment = input_dict["origin_segment"]
+                segment = input_dict.get("origin_segment", input_dict.get("original_segment"))
             intersection, union, target = intersection_and_union_gpu(
                 pred,
                 segment,

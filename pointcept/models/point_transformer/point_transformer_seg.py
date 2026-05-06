@@ -193,12 +193,18 @@ class Bottleneck(nn.Module):
 
 
 class PointTransformerSeg(nn.Module):
-    def __init__(self, block, blocks, in_channels=6, num_classes=13):
+    def __init__(self, block, blocks, in_channels=6, num_classes=13,
+                    planes=None, nsample=None, stride=None, share_planes=8,):
         super().__init__()
         self.in_channels = in_channels
-        self.in_planes, planes = in_channels, [32, 64, 128, 256, 512]
-        fpn_planes, fpnhead_planes, share_planes = 128, 64, 8
-        stride, nsample = [1, 4, 4, 4, 4], [8, 16, 16, 16, 16]
+        planes = [32, 64, 128, 256, 512] if planes is None else planes
+        nsample = [8, 16, 16, 16, 16] if nsample is None else nsample
+        stride = [1, 4, 4, 4, 4] if stride is None else stride
+        self.in_planes = in_channels
+
+        # self.in_planes, planes = in_channels, [32, 64, 128, 256, 512]
+        # fpn_planes, fpnhead_planes, share_planes = 128, 64, 8
+        # stride, nsample = [1, 4, 4, 4, 4], [8, 16, 16, 16, 16]
         self.enc1 = self._make_enc(
             block,
             planes[0],
@@ -324,4 +330,39 @@ class PointTransformerSeg50(PointTransformerSeg):
     def __init__(self, **kwargs):
         super(PointTransformerSeg50, self).__init__(
             Bottleneck, [1, 2, 3, 5, 2], **kwargs
+        )
+
+
+@MODELS.register_module("PointTransformer-Seg50Wide")
+class PointTransformerSeg50Wide(PointTransformerSeg):
+    def __init__(self, **kwargs):
+        super(PointTransformerSeg50Wide, self).__init__(
+            Bottleneck,
+            [1, 2, 3, 5, 2],
+            planes=[48, 96, 192, 384, 512],
+            nsample=[8, 16, 16, 24, 32],
+            **kwargs
+        )
+
+@MODELS.register_module("PointTransformer-Seg74Wide")
+class PointTransformerSeg50Wide(PointTransformerSeg):
+    def __init__(self, **kwargs):
+        super(PointTransformerSeg50Wide, self).__init__(
+            Bottleneck,
+            [2, 3, 5, 6, 3],
+            planes=[64, 128, 256, 384, 512],
+            nsample=[8, 16, 24, 24, 32],
+            **kwargs
+        )
+
+@MODELS.register_module("PointTransformer-Seg74Local")
+class PointTransformerSeg50Wide(PointTransformerSeg):
+    def __init__(self, **kwargs):
+        super(PointTransformerSeg50Wide, self).__init__(
+            Bottleneck,
+            [2, 3, 5, 6, 3],
+            planes=[64, 128, 256, 384, 512],
+            nsample=[8, 16, 16, 16, 16],
+            stride=[1, 2, 4, 4, 4],
+            **kwargs
         )

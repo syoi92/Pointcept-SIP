@@ -40,8 +40,12 @@ class IterationTimer(HookBase):
 
     def before_train(self):
         self._start_time = time.perf_counter()
-        _remain_epoch = self.trainer.max_epoch - self.trainer.start_epoch
-        self._remain_iter = _remain_epoch * len(self.trainer.train_loader)
+        if "global_update_step" in self.trainer.comm_info:
+            curr_step = int(self.trainer.comm_info["global_update_step"])
+            self._remain_iter = max(0, int(self.trainer.max_iter) - curr_step)
+        else:
+            _remain_epoch = self.trainer.max_epoch - self.trainer.start_epoch
+            self._remain_iter = _remain_epoch * len(self.trainer.train_loader)
 
     def before_epoch(self):
         self._iter_timer.reset()
@@ -54,7 +58,9 @@ class IterationTimer(HookBase):
         batch_time = self._iter_timer.seconds()
         self._iter_timer.reset()
         self.trainer.storage.put_scalar("batch_time", batch_time)
-        self._remain_iter -= 1
+        # self._remain_iter -= 1
+        self._remain_iter -= int(self.trainer.comm_info.get("update_in_step", 1))
+        self._remain_iter = max(0, self._remain_iter)
         remain_time = self._remain_iter * self.trainer.storage.history("batch_time").avg
         t_m, t_s = divmod(remain_time, 60)
         t_h, t_m = divmod(t_m, 60)
@@ -164,6 +170,101 @@ class InformationWriter(HookBase):
                         step=wandb.run.step,
                     )
 
+@HOOKS.register_module()
+class SIPInformationWriter(HookBase):
+    def __init__(self):
+        self.curr_iter = 0
+        self.model_output_keys = []
+
+    def before_train(self):
+        self.trainer.comm_info["iter_info"] = ""
+        self.curr_iter = self.trainer.start_epoch * len(self.trainer.train_loader)
+        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
+            wandb.define_metric("params/*", step_metric="Iter")
+            wandb.define_metric("train_batch/*", step_metric="Iter")
+            wandb.define_metric("train/*", step_metric="Epoch")
+
+    def before_step(self):
+        self.curr_iter += 1
+        global_step = int(self.trainer.comm_info["global_update_step"])
+        max_step = int(getattr(self.trainer, "max_iter", 0))
+        info = "Train: [CP {epoch}][epoch {r_epoch}][iter {iter}/{max_iter}][step {step}/{max_step}] ".format(
+            epoch=self.trainer.epoch + 1,
+            r_epoch = int((self.trainer.comm_info["iter"]+1) // 20 + self.trainer.epoch * len(self.trainer.train_loader)/20),
+            iter=self.trainer.comm_info["iter"] + 1,
+            max_iter=len(self.trainer.train_loader),
+            step=global_step,
+            max_step=max_step,
+        )
+        self.trainer.comm_info["iter_info"] += info
+
+
+    def after_step(self):
+        if "model_output_dict" in self.trainer.comm_info.keys():
+            model_output_dict = self.trainer.comm_info["model_output_dict"]
+            self.model_output_keys = model_output_dict.keys()
+            for key in self.model_output_keys:
+                self.trainer.storage.put_scalar(key, model_output_dict[key].item())
+
+        for key in self.model_output_keys:
+            self.trainer.comm_info["iter_info"] += "{key}: {value:.4f} ".format(
+                key=key, value=self.trainer.storage.history(key).val
+            )
+        lr = self.trainer.optimizer.state_dict()["param_groups"][0]["lr"]
+        if "update_in_step" in self.trainer.comm_info:
+            self.trainer.comm_info["iter_info"] += "Upd: {upd} ".format(
+                upd=self.trainer.comm_info["update_in_step"]
+            )
+        self.trainer.comm_info["iter_info"] += "Lr: {lr:.5f}".format(lr=lr)
+        self.trainer.logger.info(self.trainer.comm_info["iter_info"])
+        self.trainer.comm_info["iter_info"] = ""  # reset iter info
+        if self.trainer.writer is not None:
+            self.trainer.writer.add_scalar("params/lr", lr, self.curr_iter)
+            for key in self.model_output_keys:
+                self.trainer.writer.add_scalar(
+                    "train_batch/" + key,
+                    self.trainer.storage.history(key).val,
+                    self.curr_iter,
+                )
+            if self.trainer.cfg.enable_wandb:
+
+                wandb.log(
+                    {"Iter": self.curr_iter, "params/lr": lr}, step=self.curr_iter
+                )
+                for key in self.model_output_keys:
+                    wandb.log(
+                        {
+                            "Iter": self.curr_iter,
+                            f"train_batch/{key}": self.trainer.storage.history(key).val,
+                        },
+                        step=wandb.run.step,
+                    )
+
+    def after_epoch(self):
+        epoch_info = "Train result: "
+        for key in self.model_output_keys:
+            epoch_info += "{key}: {value:.4f} ".format(
+                key=key, value=self.trainer.storage.history(key).avg
+            )
+        self.trainer.logger.info(epoch_info)
+        if self.trainer.writer is not None:
+            for key in self.model_output_keys:
+                self.trainer.writer.add_scalar(
+                    "train/" + key,
+                    self.trainer.storage.history(key).avg,
+                    self.trainer.epoch + 1,
+                )
+
+            if self.trainer.cfg.enable_wandb:
+
+                for key in self.model_output_keys:
+                    wandb.log(
+                        {
+                            "Epoch": self.trainer.epoch + 1,
+                            f"train/{key}": self.trainer.storage.history(key).avg,
+                        },
+                        step=wandb.run.step,
+                    )
 
 @HOOKS.register_module()
 class CheckpointSaver(HookBase):
