@@ -5,6 +5,8 @@ from .modules import PointModule, PointModel
 # Backbones
 from .sparse_unet import *
 from .point_transformer import *
+from .pointnet2 import *
+from .pointnext import *
 from .point_transformer_v2 import *
 from .point_transformer_v3 import *
 from .stratified_transformer import *
