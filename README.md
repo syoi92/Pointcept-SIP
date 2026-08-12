@@ -72,12 +72,13 @@ Each resolution is evaluated over five random-seed runs. The table below reports
 Manifold sampling improves resolution-averaged mIoU by **+3.1 points for PNxt** and **+4.7 points for PT**, with larger gains in NP-IoU (**+5.5** and **+8.1 points**, respectively). For resolution-wise and per-class results, as well as trained model checkpoints, see [RESULTS.md](RESULTS.md).
 
 
-<!-- ### Citation
+### Citation
 ```bibtex
-@article{kim2026sipmanifold,
-  title   = {Rethinking 3D Segmentation of Single-Scan LiDAR in Construction via Incidence-aware Manifold Sampling},
-  author  = {Kim, Seongyong and Chen, Jingdao and Cho, Yong Kwon},
-  journal = {TBD},
-  year    = {2026}
+@misc{kim2026rethinking,
+  title        = {Rethinking 3D Segmentation from Individual LiDAR Scans: Incidence-Aware Sampling on the SIP Benchmark},
+  author       = {Kim, Seongyong and Chen, Jingdao and Cho, Yong Kwon},
+  year         = {2026},
+  doi          = {10.48550/arXiv.2608.07757},
+  url          = {https://arxiv.org/abs/2608.07757}
 }
-``` -->
+```
